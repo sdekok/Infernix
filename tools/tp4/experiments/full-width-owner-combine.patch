@@ -1,0 +1,187 @@
+--- a/src/models/qwen4_exp/execution/forward.cpp
++++ b/src/models/qwen4_exp/execution/forward.cpp
+@@ -119,7 +119,7 @@
+ }
+ 
+ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, std::int32_t max_context,
+-                                     KvCacheStorage storage) {
++                                     KvCacheStorage storage, bool parallel) {
+     const std::size_t t = static_cast<std::size_t>(columns);
+     const std::size_t h = c.hidden_size, w = c.residual_width(), k = c.moe.top_k;
+     const std::size_t bf = 2;
+@@ -142,6 +142,7 @@
+     // Linear and GDN scratch (chunked recurrence), plus alignment slack per allocation.
+     bytes += ops::gated_delta_net_workspace_capacity_bytes(dim(c.gdn.key_heads), dim(c.gdn.value_heads), 1,
+                                                            std::max(columns, 1));
++    if (parallel) { bytes += h * t * 4 * sizeof(float); } // up to four owner-local FP32 expert partials
+     bytes += 64ULL << 20;
+     return bytes;
+ }
+@@ -686,7 +687,7 @@
+     project(product, p.shared_down, shared, work_, s);
+     ops::moe_experts_cpu_wait(x, dispatch, source, max_jobs, expert_ws.data, outputs, s);
+     Tensor y = work_.alloc(DType::BF16, {H, T});
+-    if (experts_.parallel) { experts_.parallel->combine_experts(routing, outputs, shared, y); }
++    if (experts_.parallel) { experts_.parallel->combine_experts(routing, outputs, shared, y, work_); }
+     else { ops::moe_combine(outputs, routing, shared, y, s); }
+     return y;
+ }
+--- a/src/models/qwen4_exp/execution/forward.h
++++ b/src/models/qwen4_exp/execution/forward.h
+@@ -270,7 +270,7 @@
+     void run_mtp(const MtpCall& call);
+ 
+     [[nodiscard]] static std::size_t workspace_bytes(const TextConfig& config, std::int32_t columns,
+-                                                     std::int32_t max_context, KvCacheStorage storage);
++                                                     std::int32_t max_context, KvCacheStorage storage, bool parallel = false);
+     // Extra workspace of the MTP drafter: K/V-only calls over up to `kv_columns` columns (chunks
+     // run them inside run()) and full steps over `draft_columns` sequences.
+     [[nodiscard]] static std::size_t mtp_workspace_bytes(const TextConfig& config, std::int32_t kv_columns,
+--- a/src/models/qwen4_exp/execution/parallel.cpp
++++ b/src/models/qwen4_exp/execution/parallel.cpp
+@@ -183,8 +183,7 @@
+             const auto sizes = [&](int width) -> std::array<std::size_t, 9> {
+                 const auto entries = std::size_t(c.moe.top_k) * width;
+                 return {std::size_t(max_k) * width * 2,
+-                    std::max({std::size_t(max_n) * width, std::size_t(head_n) * std::min(width, static_columns),
+-                              i ? std::size_t(0) : std::size_t(c.hidden_size) * width}) * 4,
++                    std::max(std::size_t(max_n) * width, std::size_t(head_n) * std::min(width, static_columns)) * 4,
+                     std::size_t(c.hidden_size) * width * 2, entries * 8, entries * c.hidden_size * 2,
+                     i ? ops::moe_dispatch_bytes(c.moe.experts, static_cast<int>(entries)) : 0,
+                     i ? ops::moe_experts_workspace_bytes(c.moe.experts, static_cast<int>(entries), width, activation) : 0,
+@@ -906,7 +905,7 @@
+         copy_peer_bytes(r.expert_input.p, x.data, x.bytes(), s);
+         copy_peer_bytes(r.expert_ids.p, routing.ids.data, routing.ids.bytes(), s);
+         auto* weights = static_cast<std::byte*>(r.expert_ids.p) + routing.ids.bytes();
+-        if (T > 8 && K >= 2 * size()) { copy_peer_bytes(weights, routing.weights.data, routing.weights.bytes(), s); }
++        copy_peer_bytes(weights, routing.weights.data, routing.weights.bytes(), s);
+         Tensor local_x(r.expert_input.p, DType::BF16, {x.ne[0], T}), output(r.expert_outputs.p, DType::BF16, {x.ne[0], K * T});
+         ops::MoeRouting local; local.ids = Tensor(r.expert_ids.p, DType::I32, {K, T});
+         local.weights = Tensor(weights, DType::FP32, {K, T});
+@@ -929,32 +928,17 @@
+         ops::moe_experts(local_x, dispatch, source, K, std::min(owned, K * T), r.expert_work.p, output, s);
+         if (prefetched && release_stream) { r.prefill_stream->after_experts(layer, s); }
+         Tensor partial(r.expert_partials.p, DType::FP32, {x.ne[0], T});
+-        if (T > 8 && K >= 2 * size()) { ops::moe_combine_owner(output, local, i, size(), partial, s); }
++        ops::moe_combine_owner(output, local, i, size(), partial, s);
+         CUDA_CHECK(cudaEventRecord(r.experts_done, s));
+     }
+ }
+ void ParallelExecution::combine_experts(const ops::MoeRouting& routing, const Tensor& outputs,
+-    const Tensor& shared, Tensor& y) {
++    const Tensor& shared, Tensor& y, WorkspaceArena& work) {
+     auto& p = *impl_; p.primary.bind_to_current_thread();
+     const int H = y.ne[0], T = y.ne[1];
+-    // Wide calls amortize owner contractions and DMA. Narrow calls retain the
+-    // ordered slot gather and combine, avoiding four extra reduction launches.
+-    if (T <= 8 || routing.ids.ne[0] < 2 * size()) {
+-        Tensor gathered = outputs;
+-        for (int i = 1; i < size(); ++i) {
+-            auto& r = *p.ranks[i]; CUDA_CHECK(cudaStreamWaitEvent(p.primary.stream, r.experts_done, 0));
+-            Tensor peer(r.expert_outputs.p, DType::BF16, {outputs.ne[0], outputs.ne[1]});
+-            gather_peer_experts(peer, routing.ids, gathered, i, size(), p.primary.stream);
+-        }
+-        ops::moe_combine(gathered, routing, shared, y, p.primary.stream);
+-        return;
+-    }
+-    // All root expert reads finish in this stream before reusing their output
+-    // arena. The last dense projection has already consumed rank0.output.
+-    Tensor root(p.ranks.front()->output.p, DType::FP32, {H, T});
++    Tensor partials = work.alloc(DType::FP32, {H, T, size()});
++    Tensor root = partials.slice(2, 0, 1).view({H, T});
+     ops::moe_combine_owner(outputs, routing, 0, size(), root, p.primary.stream);
+-    Tensor partials(outputs.data, DType::FP32, {H, T, size()});
+-    copy_peer_bytes(partials.data, root.data, root.bytes(), p.primary.stream);
+     for (int i = 1; i < size(); ++i) {
+         auto& r = *p.ranks[i]; CUDA_CHECK(cudaStreamWaitEvent(p.primary.stream, r.experts_done, 0));
+         auto destination = partials.slice(2, i, 1);
+--- a/src/models/qwen4_exp/execution/parallel.h
++++ b/src/models/qwen4_exp/execution/parallel.h
+@@ -46,7 +46,7 @@
+                           Tensor& output);
+     void begin_experts(std::uint32_t layer, const Tensor& x, const ops::MoeRouting& routing,
+                        bool streamed, bool release_stream);
+-    void combine_experts(const ops::MoeRouting& routing, const Tensor& outputs, const Tensor& shared, Tensor& y);
++    void combine_experts(const ops::MoeRouting& routing, const Tensor& outputs, const Tensor& shared, Tensor& y, WorkspaceArena& work);
+     Tensor attention(const AttentionParameters& parameters, const Tensor& x,
+                      const AttentionCall& call, const Tensor& block_tables,
+                      const ops::PreparedRope& rope, WorkspaceArena& work);
+--- a/src/models/qwen4_exp/program/program_impl.h
++++ b/src/models/qwen4_exp/program/program_impl.h
+@@ -634,7 +634,7 @@
+                                        std::int32_t lanes, std::int32_t columns) {
+         const std::int32_t W = d.max_width;
+         std::size_t bytes =
+-            execution::Forward::workspace_bytes(c, std::max(columns, lanes * W), dim(o.max_context), o.kv_cache) +
++            execution::Forward::workspace_bytes(c, std::max(columns, lanes * W), dim(o.max_context), o.kv_cache, !o.parallel_devices.empty()) +
+             ops::sampling_workspace_capacity_bytes(d.token_domain, 1, lanes);
+         if (W > 1) {
+             bytes += ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(d.token_domain, 1, W - 1, 1, lanes);
+--- a/tests/test_parallel_combine.cpp
++++ b/tests/test_parallel_combine.cpp
+@@ -13,7 +13,7 @@
+ using namespace infernix;
+ namespace t = infernix::test;
+ void require(bool pass, const char* reason) { if (!pass) { throw std::runtime_error(reason); } }
+-void run(DeviceContext& device, int H, int T, int R, bool skew, bool mapped = false, bool alias = false) {
++void run(DeviceContext& device, int H, int T, int R, bool skew, bool mapped = false) {
+     constexpr int K = 10;
+     const std::size_t cells = std::size_t(H) * T;
+     std::vector<std::int32_t> ids(K*T), owner_map(512);
+@@ -26,7 +26,6 @@
+     for (auto& x : gates) { x = std::abs(draw()); }
+     for (auto& x : values) { x = t::f32_to_bf16(draw() * 8); }
+     for (auto& x : shared) { x = t::f32_to_bf16(draw()); }
+-    DeviceBuffer alias_output(cells*K*2), root_partial(cells*4);
+     DeviceBuffer dm(owner_map.size()*4), di(ids.size()*4), dw(weights.size()*4), dg(gates.size()*4), ds(cells*2), dp(cells*R*4), dy(cells*2);
+     dm.copy_from_host(owner_map.data(),dm.bytes);
+     di.copy_from_host(ids.data(), di.bytes); dw.copy_from_host(weights.data(), dw.bytes);
+@@ -40,23 +39,20 @@
+         inputs.emplace_back(local.size()*2); inputs.back().copy_from_host(local.data(), local.size()*2);
+     }
+     ops::MoeRouting routing{Tensor(di.p,DType::I32,{K,T}), Tensor(dw.p,DType::FP32,{K,T}), Tensor(dg.p,DType::FP32,{T})};
+-    Tensor partials(alias ? alias_output.p : dp.p,DType::FP32,{H,T,R}), ts(ds.p,DType::BF16,{H,T}), y(dy.p,DType::BF16,{H,T});
++    Tensor partials(dp.p,DType::FP32,{H,T,R}), ts(ds.p,DType::BF16,{H,T}), y(dy.p,DType::BF16,{H,T});
+     const auto call = [&] {
+-        if (alias) { CUDA_CHECK(cudaMemcpyAsync(alias_output.p, inputs[0].p, inputs[0].bytes, cudaMemcpyDeviceToDevice, device.stream)); }
+         for (int r = 0; r < R; ++r) {
+-            Tensor output(alias && r == 0 ? alias_output.p : inputs[r].p,DType::BF16,{H,K*T});
+-            auto p = alias && r == 0 ? Tensor(root_partial.p,DType::FP32,{H,T}) : partials.slice(2,r,1).view({H,T});
++            Tensor output(inputs[r].p,DType::BF16,{H,K*T}); auto p = partials.slice(2,r,1).view({H,T});
+             ops::moe_combine_owner(output,routing,r,R,p,device.stream,mapped ? static_cast<const std::int32_t*>(dm.p) : nullptr);
+         }
+-        if (alias) { CUDA_CHECK(cudaMemcpyAsync(partials.data, root_partial.p, root_partial.bytes, cudaMemcpyDeviceToDevice, device.stream)); }
+         ops::moe_combine_partials(partials,routing,ts,y,device.stream);
+     };
+     call(); device.synchronize();
+     std::vector<std::uint16_t> eager(cells), captured(cells); std::vector<float> actual(cells*R), replay(cells*R);
+-    dy.copy_to_host(eager.data(),dy.bytes); CUDA_CHECK(cudaMemcpy(actual.data(),partials.data,cells*R*4,cudaMemcpyDeviceToHost));
++    dy.copy_to_host(eager.data(),dy.bytes); dp.copy_to_host(actual.data(),dp.bytes);
+     DecodeGraphDefinition definition; DecodeGraphExecutable graph;
+     definition.capture(device.stream,call); graph.instantiate(definition); graph.launch(device.stream); device.synchronize();
+-    dy.copy_to_host(captured.data(),dy.bytes); CUDA_CHECK(cudaMemcpy(replay.data(),partials.data,cells*R*4,cudaMemcpyDeviceToHost));
++    dy.copy_to_host(captured.data(),dy.bytes); dp.copy_to_host(replay.data(),dp.bytes);
+     require(eager==captured && actual==replay,"owner combine captured/eager differ");
+     for (int token = 0; token < T; ++token) for (int d = 0; d < H; ++d) {
+         double reference=0, magnitude=0;
+@@ -74,18 +70,14 @@
+         const double arithmetic=std::ldexp(double(2*K+R+4),-24)*magnitude;
+         require(std::isfinite(got) && std::abs(got-reference)<=std::abs(reference)/256+arithmetic*(1+1./256)+std::ldexp(1.,-133),"combined output exceeds FP64/BF16 bound");
+     }
+-    std::printf("PASS GPU%d H=%d T=%d R=%d skew=%d alias=%d: FP64 partials/full sum, poisoned unowned slots, captured replay\n",device.device,H,T,R,int(skew),int(alias));
++    std::printf("PASS GPU%d H=%d T=%d R=%d skew=%d: FP64 partials/full sum, poisoned unowned slots, captured replay\n",device.device,H,T,R,int(skew));
+ }
+ int main() { try {
+     int count=0; if(cudaGetDeviceCount(&count)!=cudaSuccess||count<1)return 77;
+     for(int device=0;device<std::min(count,4);++device) { DeviceContext gpu(device);
+         for(int ranks:{2,3,4})for(bool skew:{false,true})run(gpu,257,3,ranks,skew);
+         run(gpu,257,31,4,true,true);
+-        run(gpu,257,31,4,true,true,true);
+-        if(device==0) {
+-            for(int columns:{1,8,31,256,2048})for(bool skew:{false,true})run(gpu,2560,columns,4,skew);
+-            for(int columns:{9,512,2048})for(bool skew:{false,true})run(gpu,2560,columns,4,skew,false,true);
+-        }
++        if(device==0)for(int columns:{1,8,31,256,2048})for(bool skew:{false,true})run(gpu,2560,columns,4,skew);
+     }
+     return 0;
+ } catch(const std::exception& e){std::fprintf(stderr,"FAIL %s\n",e.what());return 1;} }

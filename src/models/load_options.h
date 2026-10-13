@@ -20,6 +20,9 @@ struct LoadOptions {
     // Qwen4Exp: the routed expert banks stay in the artifact and are read in place by the SSD
     // expert tier (design §19.3.7) instead of being pinned in host memory.
     bool stream_experts = false;
+    std::vector<int> parallel_devices;
+    bool pipeline_parallel = false;
+    bool fixed_kv_owners = false;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -71,7 +74,7 @@ struct LoadOptions {
     return mode == VisionOffload::On || (mode == VisionOffload::Auto && architecture == Architecture::Qwen4Exp);
 }
 
-[[nodiscard]] inline LoadOptions load_options(const EngineOptions& options, Architecture architecture) noexcept {
+[[nodiscard]] inline LoadOptions load_options(const EngineOptions& options, Architecture architecture) {
     return {.purpose                  = options.purpose,
             .vision                   = options.enable_vision,
             .vision_offload           = resolve_vision_offload(options.vision_offload, architecture),
@@ -79,7 +82,10 @@ struct LoadOptions {
             .speculative              = options.speculative.backend,
             .proposal_head            = options.speculative.proposal_head,
             .rope_yarn_factor         = options.rope_yarn_factor,
-            .a16_activations          = options.a16_activations};
+            .a16_activations          = options.a16_activations,
+            .parallel_devices        = options.parallel_devices,
+            .pipeline_parallel       = options.pipeline_parallel,
+            .fixed_kv_owners         = options.fixed_kv_owners};
 }
 
 } // namespace infernix::models

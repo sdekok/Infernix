@@ -39,6 +39,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -86,6 +87,15 @@ public:
     ~ExpertResidency();
     ExpertResidency(const ExpertResidency&)            = delete;
     ExpertResidency& operator=(const ExpertResidency&) = delete;
+
+    // Fixed EP ownership; only owned experts enter this cache's policy. Peers
+    // borrow the primary's round lifecycle, but own their allocations and streams.
+    void set_owner(int rank, int count, bool pipeline = false);
+    bool owns(std::uint32_t layer, std::uint32_t expert) const noexcept;
+    const std::int32_t* owners(std::uint32_t layer) const noexcept { return owner_device_.p ? static_cast<const std::int32_t*>(owner_device_.p) + layer * experts_ : nullptr; }
+    void attach_peer(ExpertResidency& cache, DeviceContext& device);
+    // Cache loans can back scratch read by other GPUs. Applies to current and future VMM mappings.
+    void allow_peer_access(int device);
 
     // Device bytes besides the frames: the frame tables and the route log.
     [[nodiscard]] static std::uint64_t table_bytes(const TextConfig& config, std::int32_t max_columns) noexcept;
@@ -135,7 +145,9 @@ public:
 
     // Whether the pool can resize after its first size (VMM).
     [[nodiscard]] bool elastic() const noexcept { return arena_ != nullptr; }
-    [[nodiscard]] std::uint32_t frame_limit() const noexcept { return limit_; }
+    [[nodiscard]] std::uint32_t frame_limit() const noexcept {
+        return std::min(limit_, owned_records_);
+    }
     // Bytes the frames occupy now (whole chunks with VMM).
     [[nodiscard]] std::uint64_t pool_bytes() const noexcept;
 
@@ -186,8 +198,21 @@ public:
                      std::span<const std::uint8_t> live = {});
 
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
+    struct OwnerStats { int device; std::uint32_t frames; Stats counters; };
+    [[nodiscard]] std::vector<OwnerStats> owner_stats() const;
 
 private:
+    struct Peer {
+        ExpertResidency* cache;
+        DeviceContext* device;
+        std::unique_ptr<CudaCompletionEvent> ready;
+    };
+    int device_ = 0;
+    std::uint32_t owner_rank_ = 0, owner_count_ = 1;
+    std::uint32_t owned_records_ = UINT32_MAX;
+    std::vector<std::int32_t> owner_host_;
+    DeviceBuffer owner_device_;
+    std::vector<Peer> peers_;
     void upload_table(cudaStream_t compute);
     // Returns every reserved landing frame to the pool.
     void release_reservations();

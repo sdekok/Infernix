@@ -146,6 +146,19 @@ struct QsaAppend {
     Tensor v;
 };
 
+/// Head-independent block selection, reusable by attention on disjoint KV heads.
+/// blocks: I32 [budget / ratio, T], ascending selected IDs; counts: I32 [T],
+/// either budget / ratio or -1 for dense attention (then blocks are not read).
+struct QsaSelection {
+    Tensor blocks;
+    Tensor counts;
+};
+[[nodiscard]] std::size_t qsa_selection_workspace_bytes(const QsaGeometry& geometry,
+    std::int32_t columns, std::int32_t max_context);
+void qsa_select_blocks(const Tensor& index_q, const QsaKVLayer& layer, const QsaBatch& batch,
+    const QsaGeometry& geometry, std::int32_t max_context, void* workspace,
+    std::size_t workspace_bytes, QsaSelection& selection, cudaStream_t stream);
+
 /// q: BF16 [head_dim, heads, T] (normalized, rotated); index_q: BF16 [Di, index_heads, T] from
 /// qsa_index_query. out: BF16 [head_dim, heads, T]. The call's pooled keys are already in their
 /// plane. Keys and values:
@@ -157,9 +170,13 @@ struct QsaAppend {
 ///     a window slot for keys before the call, the call's own row for its columns (staged in the
 ///     workspace for calls wider than kKVWindowInlineWidth, which take one sequence, and committed
 ///     to the window afterwards); from its codes otherwise.
+/// If selection is supplied, it must be the result of qsa_select_blocks for this
+/// same call's positions, index queries and pooled keys, available on this stream.
+/// This selection can be copied between disjoint head owners without copying K/V.
 void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& layer,
                    const QsaBatch& batch, const QsaGeometry& geometry, float scale,
                    std::int32_t max_context, void* workspace, std::size_t workspace_bytes,
-                   Tensor& out, cudaStream_t stream, const QsaAppend* append = nullptr);
+                   Tensor& out, cudaStream_t stream, const QsaAppend* append = nullptr,
+                   const QsaSelection* selection = nullptr);
 
 } // namespace infernix::ops

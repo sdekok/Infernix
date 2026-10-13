@@ -1,4 +1,5 @@
 #include "models/qwen4_exp/program/expert_residency.h"
+#include "models/qwen4_exp/head_partition.h"
 
 #include "models/qwen4_exp/program/host_expert_tier.h"
 
@@ -17,6 +18,10 @@ namespace {
 using expert_cache::CacheController;
 using expert_cache::ResidencyEntry;
 using expert_cache::ResidencyState;
+struct RestoreDevice {
+    int device;
+    ~RestoreDevice() { (void)cudaSetDevice(device); }
+};
 
 // Frames kept free for one round's promotions while its victims' frames retire. None: the
 // Program calls after_round only on a quiescent compute stream, and its on_quiescent frees every
@@ -40,7 +45,7 @@ std::uint32_t ExpertResidency::max_frames(const TextConfig& config) noexcept {
 
 ExpertResidency::ExpertResidency(const TextConfig& config, std::vector<const std::uint8_t*> banks,
                                  std::uint64_t record_stride, std::int32_t max_columns, int device)
-    : c_(config), banks_(std::move(banks)), stride_(record_stride) {
+    : device_(device), c_(config), banks_(std::move(banks)), stride_(record_stride) {
     experts_ = config.moe.experts;
     layers_  = config.num_hidden_layers;
     top_k_   = config.moe.top_k;
@@ -80,7 +85,17 @@ ExpertResidency::ExpertResidency(const TextConfig& config, std::vector<const std
     table_dirty_ = false;
 }
 
+std::vector<ExpertResidency::OwnerStats> ExpertResidency::owner_stats() const {
+    std::vector<OwnerStats> out{{device_, frames_, stats_}};
+    for (const auto& peer : peers_) {
+        out.push_back({peer.device->device, peer.cache->frames(), peer.cache->stats()});
+    }
+    return out;
+}
+
 ExpertResidency::~ExpertResidency() {
+    peers_.clear();
+    (void)cudaSetDevice(device_);
     if (copy_stream_ != nullptr) { (void)cudaStreamSynchronize(copy_stream_); }
     if (d2h_stream_ != nullptr) {
         (void)cudaStreamSynchronize(d2h_stream_);
@@ -91,6 +106,43 @@ ExpertResidency::~ExpertResidency() {
     for (auto event : spare_events_) { (void)cudaEventDestroy(event); }
     if (table_ready_ != nullptr) { (void)cudaEventDestroy(table_ready_); }
     if (copy_stream_ != nullptr) { (void)cudaStreamDestroy(copy_stream_); }
+}
+
+void ExpertResidency::set_owner(int rank, int count, bool pipeline) {
+    if (count <= 0 || rank < 0 || rank >= count || round_ != 0 || frames_ != 0) {
+        throw std::invalid_argument("expert owner must be set before sizing or execution");
+    }
+    owner_rank_ = static_cast<std::uint32_t>(rank);
+    owner_count_ = static_cast<std::uint32_t>(count);
+    owner_host_.resize(layers_ * experts_); owned_records_ = 0;
+    for (std::uint32_t l = 0; l < layers_; ++l) for (std::uint32_t e = 0; e < experts_; ++e) {
+        const int owner = parallel_expert_owner(l, e, experts_, layers_, count, pipeline);
+        owner_host_[l * experts_ + e] = owner; owned_records_ += owner == rank;
+    }
+    owner_device_ = DeviceBuffer(owner_host_.size() * sizeof(std::int32_t));
+    owner_device_.copy_from_host(owner_host_.data(), owner_device_.bytes);
+}
+
+bool ExpertResidency::owns(std::uint32_t layer, std::uint32_t expert) const noexcept {
+    return owner_host_.empty() || owner_host_[layer * experts_ + expert] == int(owner_rank_);
+}
+
+void ExpertResidency::allow_peer_access(int device) {
+    if (arena_) { arena_->allow_access(device); }
+}
+
+void ExpertResidency::attach_peer(ExpertResidency& cache, DeviceContext& device) {
+    if (&cache == this || round_ != 0) { throw std::invalid_argument("invalid peer expert cache"); }
+    try {
+        // A long prefill borrows this arena for residuals and call metadata,
+        // which the tensor-parallel owners read directly over P2P.
+        if (arena_) { arena_->allow_access(device.device); }
+        peers_.push_back({&cache, &device, std::make_unique<CudaCompletionEvent>(device)});
+    } catch (...) {
+        (void)cudaSetDevice(device_);
+        throw;
+    }
+    CUDA_CHECK(cudaSetDevice(device_));
 }
 
 const std::uint8_t* ExpertResidency::frame_base() const noexcept {
@@ -107,7 +159,7 @@ ExpertResidency::Resize ExpertResidency::resize(std::uint32_t frames, cudaStream
         out.frames = frames_; // a lease holds frames: the next boundary after its return resizes
         return out;
     }
-    frames = std::min(frames, limit_);
+    frames = std::min(frames, frame_limit());
     finish_demotions(compute, true); // held frames return before frames move or go
     CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
     publish_landed();
@@ -327,6 +379,12 @@ void ExpertResidency::tier_step(cudaStream_t compute) {
 }
 
 void ExpertResidency::before_round(cudaStream_t compute, bool landing, bool walking) {
+    RestoreDevice restore{device_};
+    for (auto& peer : peers_) {
+        peer.device->bind_to_current_thread();
+        peer.cache->before_round(peer.device->stream, false, walking);
+    }
+    CUDA_CHECK(cudaSetDevice(device_));
     publish_landed();
     if (tier_ != nullptr) {
         finish_demotions(compute, false);
@@ -414,6 +472,14 @@ void ExpertResidency::publish_landed() {
 }
 
 void ExpertResidency::enqueue_route_download(cudaStream_t compute, std::int32_t columns) {
+    RestoreDevice restore{device_};
+    for (auto& peer : peers_) {
+        peer.device->bind_to_current_thread();
+        peer.cache->enqueue_route_download(peer.device->stream, columns);
+        peer.ready->record(peer.device->stream);
+        CUDA_CHECK(cudaSetDevice(device_));
+        peer.ready->wait(compute);
+    }
     const std::size_t used = static_cast<std::size_t>(top_k_) * static_cast<std::size_t>(columns);
     if (used > route_stride_) { throw std::logic_error("expert residency: round exceeds the route log"); }
     // Only the round's columns of each layer's log.
@@ -429,6 +495,12 @@ void ExpertResidency::enqueue_route_download(cudaStream_t compute, std::int32_t 
 
 void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, std::size_t per_layer_budget,
                                   std::span<const std::uint8_t> live) {
+    RestoreDevice restore{device_};
+    for (auto& peer : peers_) {
+        peer.device->bind_to_current_thread();
+        peer.cache->after_round(peer.device->stream, columns, per_layer_budget, live);
+    }
+    CUDA_CHECK(cudaSetDevice(device_));
     const auto* routes = static_cast<const std::int32_t*>(route_host_.data());
     auto* table        = static_cast<std::int32_t*>(table_host_.data());
     const std::size_t used = static_cast<std::size_t>(top_k_) * static_cast<std::size_t>(columns);
@@ -444,7 +516,7 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
         for (std::size_t i = 0; i < used; ++i) {
             if (!live.empty() && live[i / top_k_] == 0) { continue; }
             const auto expert = static_cast<std::uint32_t>(ids[i]);
-            if (expert >= experts_ || seen_[expert]) { continue; }
+            if (expert >= experts_ || !owns(layer, expert) || seen_[expert]) { continue; }
             seen_[expert] = 1;
             group_.push_back(layer * experts_ + expert);
         }
@@ -522,24 +594,38 @@ ExpertResidency::SavedState ExpertResidency::saved_state() const {
     out.ranked.assign(policy.residents().begin(), policy.residents().end());
     std::stable_sort(out.ranked.begin(), out.ranked.end(),
                      [&](std::uint32_t a, std::uint32_t b) { return policy.score(a) > policy.score(b); });
+    for (const auto& peer : peers_) {
+        const auto saved = peer.cache->saved_state();
+        for (std::size_t i = 0; i < saved.counts.size(); ++i) { out.counts[i] += saved.counts[i]; }
+        out.ranked.insert(out.ranked.end(), saved.ranked.begin(), saved.ranked.end());
+    }
     return out;
 }
 
 std::uint32_t ExpertResidency::warm_start(const SavedState& state, std::uint32_t count_cap, std::uint32_t max_keys,
                                           cudaStream_t compute) {
+    RestoreDevice restore{device_};
+    for (auto& peer : peers_) {
+        peer.device->bind_to_current_thread();
+        peer.cache->warm_start(state, count_cap, max_keys, peer.device->stream);
+    }
+    CUDA_CHECK(cudaSetDevice(device_));
     if (!controller_ || frames_ == 0) { return 0; }
     if (!state.counts.empty() && state.counts.size() != static_cast<std::size_t>(layers_) * experts_) {
         throw std::invalid_argument("expert residency: the saved state has another key count");
     }
     std::vector<std::uint32_t> counts(state.counts);
-    for (auto& count : counts) { count = std::min(count, count_cap); }
+    for (std::size_t i = 0; i < counts.size(); ++i) {
+        counts[i] = owns(i / experts_, i % experts_) ? std::min(counts[i], count_cap) : 0;
+    }
     commands_.clear();
     // With a tier only keys the warm pre-fill put in RAM can be loaded.
     std::vector<std::uint32_t> in_ram;
     const std::vector<std::uint32_t>* keys = &state.ranked;
-    if (tier_ != nullptr) {
+    if (tier_ != nullptr || owner_count_ > 1) {
         for (const std::uint32_t key : state.ranked) {
-            if (tier_->record(key) != nullptr) { in_ram.push_back(key); }
+            if (owns(key / experts_, key % experts_) &&
+                (tier_ == nullptr || tier_->record(key) != nullptr)) { in_ram.push_back(key); }
         }
         keys = &in_ram;
     }

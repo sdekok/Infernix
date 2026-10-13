@@ -5,6 +5,9 @@ download an artifact using the [project README](../README.md) before following t
 
 The examples use Qwen3.8-27B NVFP4 with FP8 KV storage.
 
+Flash-Next additionally has an experimental `--parallel-devices 0,1,2,3` option
+with `--device 0`; see [multi-GPU requirements](qwen3_8-flash-next.md#experimental-multi-gpu).
+
 ## Text input
 
 ```bash
@@ -265,6 +268,9 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128; rounded down to whole prompt-attention waves (896 tokens for the 24-head model on RTX 5090) with INT8, NVFP4, FP8, K8V4, VQ2 or K4V2 KV unless an original prompt kernel is selected | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
+| `--parallel-devices IDS` | experimental Flash-Next TP/EP over 2–4 SM120 GPUs with all-pairs P2P; primary ordinal first | single GPU |
+| `--pipeline-parallel` | experimental TP2+PP2 on four selected GPUs; intended for long prompts, costs primary workspace/cache capacity | off |
+| `--fixed-kv-owners` | keep all attention KV and matching projection rows on the first two TP4 GPUs; incompatible with pipeline mode | off |
 | `--ram-headroom-mib N` | physical Host RAM in MiB that pinned weights and caches leave free for the system; startup refuses a lock that would take it (Qwen3.8-Flash-Next plans every allocation against it in its RAM ledger) | `2048` |
 | `--expert-ram-mib N\|auto` | Qwen3.8-Flash-Next: Host RAM in MiB for the routed experts; less than all of them need (~64.5 GiB) keeps that many in RAM and reads the rest from the artifact ([SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier)); more than is free is an error | `auto` (what the ledger leaves) |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4\|vq2\|k4v2` | KV-cache storage | `bf16` |

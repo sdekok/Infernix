@@ -2,6 +2,7 @@
 #include "product/constraint_observation.h"
 #include "product/speculative_options.h"
 #include "product/rope_yarn_options.h"
+#include "product/parallel_options.h"
 
 #include <algorithm>
 #include <array>
@@ -389,6 +390,9 @@ std::string usage_text(std::string_view program) {
         << "  --lm-head-draft             use the optimized proposal head; requires a speculative "
            "backend\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
+        << "  --parallel-devices <ids>    experimental Flash-Next TP+EP, e.g. 0,1,2,3\n"
+        << "  --pipeline-parallel        use TP2+PP2 on four GPUs (experimental)\n"
+        << "  --fixed-kv-owners          keep all KV heads on first two TP4 GPUs\n"
         << "  --no-cuda-graph             use eager decode\n"
         << "  --profile-measured          bracket one measured repetition with CUDA profiler API\n"
         << "  -o, --output <table|json|csv>  output format (default: table)\n"
@@ -539,6 +543,12 @@ BenchOptions parse_args(int argc, char** argv) {
                 parse_u32(value("--draft-tree-paths"), "draft-tree-paths");
         } else if (arg == "--device") {
             options.device = parse_nonnegative(value("--device"), "device");
+        } else if (arg == "--fixed-kv-owners") {
+            options.fixed_kv_owners = true;
+        } else if (arg == "--pipeline-parallel") {
+            options.pipeline_parallel = true;
+        } else if (arg == "--parallel-devices") {
+            options.parallel_devices = product::parse_parallel_devices(value("--parallel-devices"));
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--profile-measured") {
@@ -815,6 +825,11 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
                 ? std::to_string(env.decode_graph_prime_output_tokens) + " outputs"
                 : "n/a")
         << " repetitions=" << env.repetitions << " warmup=" << env.warmup << "\n\n";
+    if (!env.parallel_devices.empty()) {
+        out << "  parallel GPUs:";
+        for (const int id : env.parallel_devices) { out << ' ' << id; }
+        out << " (runtime memory statistics cover the primary GPU)\n\n";
+    }
 
     constexpr std::size_t cols                   = 11;
     const std::array<std::string, cols> headings = {
@@ -869,6 +884,13 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         formats << '"' << json_escape(env.load.weight_formats[i]) << '"';
     }
     formats << ']';
+    std::ostringstream parallel_devices;
+    parallel_devices << '[';
+    for (std::size_t i = 0; i < env.parallel_devices.size(); ++i) {
+        if (i) { parallel_devices << ','; }
+        parallel_devices << env.parallel_devices[i];
+    }
+    parallel_devices << ']';
 
     std::ostringstream out;
     out << "{\n"
@@ -879,7 +901,11 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "  \"environment\": {\"gpu_name\": \"" << json_escape(env.gpu_name)
         << "\", \"cuda_runtime_version\": \"" << json_escape(env.cuda_runtime_version)
         << "\", \"cuda_driver_version\": \"" << json_escape(env.cuda_driver_version)
-        << "\", \"device_id\": " << env.device_id << "},\n"
+        << "\", \"device_id\": " << env.device_id
+        << ", \"parallel_devices\": " << parallel_devices.str()
+        << ", \"pipeline_parallel\": " << (env.pipeline_parallel ? "true" : "false")
+        << ", \"fixed_kv_owners\": " << (env.fixed_kv_owners ? "true" : "false")
+        << ", \"runtime_memory_scope\": \"primary\"},\n"
         << "  \"artifact\": {\"path\": \"" << json_escape(env.artifact_path)
         << "\", \"file_size_bytes\": " << env.artifact_file_size_bytes << "},\n"
         << "  \"load\": {\n"
@@ -1017,6 +1043,12 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
                 << product::constraint_observation_json(rep.constraint).dump() << ",\n"
                 << "          \"constraint_draft_wait_exposed_seconds\": "
                 << number(rep.constraint_draft_wait_exposed_seconds) << ",\n";
+            out << "          \"generated_token_ids\": [";
+            for (std::size_t t = 0; t < rep.generated_token_ids.size(); ++t) {
+                if (t) { out << ", "; }
+                out << rep.generated_token_ids[t];
+            }
+            out << "],\n";
             append_timings_json(out, rep.timings, "          ");
             out << ",\n";
             append_speculative_json(out, rep.speculative, "          ");

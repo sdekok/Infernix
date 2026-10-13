@@ -6,6 +6,7 @@
 #include "ops/qsa/page_spaces.cuh"
 
 #include "core/device.h"
+#include "core/cuda_function_attributes.h"
 #include "core/paged_kv_cache.h"
 #include "core/pdl.cuh"
 #include "ops/common/score_id_order.cuh"
@@ -15,7 +16,6 @@
 #include <cuda_bf16.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -812,21 +812,16 @@ ScoreTiles score_tiles(std::int32_t begin, std::int32_t columns, std::int32_t wi
     return tiles;
 }
 
-// Opts a kernel into `bytes` of dynamic shared memory beyond the default 48 KiB, once per size.
-template <class Kernel>
-void reserve_shared(Kernel kernel, std::size_t bytes, std::atomic<std::size_t>& reserved) {
-    if (bytes <= 48 * 1024 || bytes <= reserved.load(std::memory_order_acquire)) { return; }
+// Dynamic selection scratch depends on max_context; reserve it on each owner.
+template <auto Kernel>
+void reserve_shared(std::size_t bytes) {
+    if (bytes <= 48 * 1024) { return; }
     int device = 0, limit = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     CUDA_CHECK(cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
     require(bytes <= static_cast<std::size_t>(limit), "max_context needs more shared memory than a CTA has");
-    CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes)));
-    std::size_t seen = reserved.load(std::memory_order_relaxed);
-    while (seen < bytes && !reserved.compare_exchange_weak(seen, bytes, std::memory_order_acq_rel)) {}
+    prepare_cuda_shared<Kernel>(static_cast<int>(bytes));
 }
-
-std::atomic<std::size_t> g_global_reserved{0};
-std::atomic<std::size_t> g_wide_reserved{0};
 
 } // namespace
 
@@ -868,7 +863,7 @@ void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatc
 
     // Dynamic shared memory: candidates (aliasing the histogram) and the column bitmap.
     const std::size_t smem = kCandidateBytes + sizeof(unsigned) * 4 * static_cast<std::size_t>(ceil_div(max_blocks + 1, 128));
-    reserve_shared(qsa_select_global_kernel, smem, g_global_reserved);
+    reserve_shared<qsa_select_global_kernel>(smem);
 
     const auto* index      = static_cast<const bf16*>(index_q.data);
     const auto* pooled     = static_cast<const bf16*>(pooled_pages.data);
@@ -881,7 +876,7 @@ void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatc
     // Wide rows take the register-tiled kernel when a block's key is 16-byte aligned in one page.
     const bool wide = batch.width >= kWideMinWidth && geometry.ratio <= kPagedKVPageSize &&
                       (kIndexDim / geometry.ratio) % 8 == 0;
-    if (wide) { reserve_shared(qsa_score_wide_kernel, kWideSharedBytes, g_wide_reserved); }
+    if (wide) { reserve_shared<qsa_score_wide_kernel>(kWideSharedBytes); }
     for (std::int32_t begin = 0; begin < columns; begin += l.group) {
         const std::int32_t n   = std::min(l.group, columns - begin);
         const ScoreTiles tiles = score_tiles(begin, n, batch.width);

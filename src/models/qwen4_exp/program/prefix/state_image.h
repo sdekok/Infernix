@@ -27,6 +27,7 @@
 #include <span>
 #include <vector>
 
+namespace infernix::models::qwen4_exp::execution { struct GdnStateShard; }
 namespace infernix::models::qwen4_exp::prefix {
 
 inline constexpr std::size_t kStateImageHeaderBytes = 256;
@@ -41,18 +42,20 @@ struct KvWindowGeometry {
     std::int32_t kv_heads   = 0; // 0: the storage has no window
     std::uint32_t kv_layers = 0;
     std::uint32_t lanes     = 0;
+    bool head_major = false;
 
     [[nodiscard]] bool present() const noexcept { return kv_heads > 0; }
     // One lane's bytes of plane p of a KV layer.
     [[nodiscard]] std::size_t lane_bytes(int plane) const;
     [[nodiscard]] std::size_t layer_bytes() const;
+    [[nodiscard]] std::size_t head_stride(int plane) const;
     [[nodiscard]] std::size_t bytes() const { return layer_bytes() * kv_layers; }
     // Offset of plane p of a KV layer from the window's base.
     [[nodiscard]] std::size_t plane_offset(std::uint32_t kv_layer, int plane) const;
 };
 
 [[nodiscard]] KvWindowGeometry kv_window_geometry(const TextConfig& config, KvCacheStorage storage, bool mtp,
-                                                  std::uint32_t lanes);
+                                                  std::uint32_t lanes, bool parallel = false);
 // KV layer k's window planes at `base` (slots unset: the forward pass sets each call's).
 [[nodiscard]] PagedKVWindowView kv_window_view(const KvWindowGeometry& geometry, void* base, std::uint32_t kv_layer);
 
@@ -123,6 +126,7 @@ void write_state_image_header(const StateImageLayout& layout, const StateImageHe
 // Where the Program keeps every lane's state (program_impl.h).
 struct LaneStateBuffers {
     const LinearAttentionStatePool* gdn = nullptr;
+    std::span<const execution::GdnStateShard> gdn_shards;
     std::uint32_t lanes                 = 0;
     std::byte* ple                      = nullptr; // lane l at ple + l * spec.ple_bytes
     // Tail slab of KV layer k (attention layers, then MTP) and lane l at
@@ -169,6 +173,8 @@ public:
                                 cudaStream_t stream) const;
 
 private:
+    struct DeviceRun { std::byte* data; std::size_t offset, bytes; };
+    [[nodiscard]] std::vector<DeviceRun> device_runs(const StateImagePart& part, std::uint32_t lane) const;
     void check_lane(std::uint32_t lane) const;
     void check_image(std::size_t segments, std::size_t segment_bytes) const;
 
@@ -186,7 +192,8 @@ struct KvPageGeometry {
     std::uint32_t planes_per_layer    = 0;
 };
 
-[[nodiscard]] KvPageGeometry kv_page_geometry(const TextConfig& config, KvCacheStorage storage, bool mtp);
+[[nodiscard]] KvPageGeometry kv_page_geometry(const TextConfig& config, KvCacheStorage storage, bool mtp,
+                                              bool parallel = false);
 
 struct PlaneRange {
     std::size_t begin = 0;

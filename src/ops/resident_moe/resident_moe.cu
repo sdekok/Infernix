@@ -107,11 +107,12 @@ __device__ float row_dot(const Bank& bank, std::int64_t row, const float* x, int
 template <class Codec>
 __global__ void __launch_bounds__(kThreads)
     gate_up_kernel(const bf16* __restrict__ x, const std::int32_t* __restrict__ ids, int top_k, int hidden,
-                   int intermediate, Bank bank, float* __restrict__ h) {
+                   int intermediate, Bank bank, float* __restrict__ h, int first_expert, int local_experts) {
     __shared__ __align__(16) float xs[kMaxHidden];
     const int entry = static_cast<int>(blockIdx.y);
     const int t     = entry / top_k;
-    const int e     = ids[entry];
+    const int e     = ids[entry] - first_expert;
+    if (e < 0 || e >= local_experts) { return; }
     for (int i = static_cast<int>(threadIdx.x); i < bank.padded_k; i += kThreads) {
         xs[staged_index<Codec>(i)] = i < hidden ? __bfloat162float(x[static_cast<std::int64_t>(t) * hidden + i]) : 0.0F;
     }
@@ -130,10 +131,11 @@ __global__ void __launch_bounds__(kThreads)
 template <class Codec>
 __global__ void __launch_bounds__(kThreads)
     down_kernel(const float* __restrict__ h, const std::int32_t* __restrict__ ids, int hidden, int intermediate,
-                Bank bank, bf16* __restrict__ out) {
+                Bank bank, bf16* __restrict__ out, int first_expert, int local_experts) {
     __shared__ __align__(16) float hs[kMaxIntermediate];
     const int entry = static_cast<int>(blockIdx.y);
-    const int e     = ids[entry];
+    const int e     = ids[entry] - first_expert;
+    if (e < 0 || e >= local_experts) { return; }
     for (int i = static_cast<int>(threadIdx.x); i < bank.padded_k; i += kThreads) {
         hs[staged_index<Codec>(i)] = i < intermediate ? h[static_cast<std::int64_t>(entry) * intermediate + i] : 0.0F;
     }
@@ -153,15 +155,15 @@ Bank bank_of(const Weight& w) {
 
 template <class Codec>
 void launch(const Tensor& x, const Tensor& ids, const Weight& gate_up, const Weight& down, int top_k, int hidden,
-            int intermediate, float* h, Tensor& outputs, cudaStream_t stream) {
+            int intermediate, float* h, Tensor& outputs, cudaStream_t stream, int first_expert, int local_experts) {
     const int entries = ids.ne[0] * ids.ne[1];
     gate_up_kernel<Codec><<<dim3((intermediate + kGateRowsPerCta - 1) / kGateRowsPerCta, entries), kThreads, 0,
                             stream>>>(static_cast<const bf16*>(x.data), static_cast<const std::int32_t*>(ids.data),
-                                      top_k, hidden, intermediate, bank_of(gate_up), h);
+                                      top_k, hidden, intermediate, bank_of(gate_up), h, first_expert, local_experts);
     CUDA_CHECK(cudaGetLastError());
     down_kernel<Codec><<<dim3((hidden + kDownRowsPerCta - 1) / kDownRowsPerCta, entries), kThreads, 0, stream>>>(
         h, static_cast<const std::int32_t*>(ids.data), hidden, intermediate, bank_of(down),
-        static_cast<bf16*>(outputs.data));
+        static_cast<bf16*>(outputs.data), first_expert, local_experts);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -178,7 +180,11 @@ std::size_t resident_moe_workspace_bytes(std::int32_t pairs, std::int32_t interm
 
 void resident_moe_experts(const Tensor& x, const Tensor& ids, const Weight& gate_up, const Weight& down,
                           std::int32_t experts, std::int32_t intermediate, void* workspace,
-                          std::size_t workspace_bytes, Tensor& outputs, cudaStream_t stream) {
+                          std::size_t workspace_bytes, Tensor& outputs, cudaStream_t stream,
+                          std::int32_t first_expert, std::int32_t local_experts) {
+    if (local_experts == -1) { local_experts = experts; }
+    require(first_expert >= 0 && local_experts > 0 && first_expert + local_experts <= experts,
+            "invalid expert partition");
     const int hidden = x.ne[0], columns = x.ne[1], top_k = ids.ne[0];
     require(x.dtype == DType::BF16 && x.is_contiguous() && ids.dtype == DType::I32 && ids.is_contiguous() &&
                 outputs.dtype == DType::BF16 && outputs.is_contiguous(),
@@ -188,7 +194,7 @@ void resident_moe_experts(const Tensor& x, const Tensor& ids, const Weight& gate
     require(hidden > 0 && hidden <= kMaxHidden && intermediate > 0 && intermediate <= kMaxIntermediate,
             "hidden or intermediate size is out of range");
     require(gate_up.qtype == down.qtype, "both banks must share one codec");
-    require(gate_up.n == experts * 2 * intermediate && gate_up.k == hidden && down.n == experts * hidden &&
+    require(gate_up.n == local_experts * 2 * intermediate && gate_up.k == hidden && down.n == local_experts * hidden &&
                 down.k == intermediate,
             "bank shapes differ from [E*2I, H] and [E*H, I]");
     require(workspace_bytes >= resident_moe_workspace_bytes(top_k * columns, intermediate) && workspace != nullptr,
@@ -199,10 +205,10 @@ void resident_moe_experts(const Tensor& x, const Tensor& ids, const Weight& gate
     auto* h = static_cast<float*>(workspace);
     if (row_split(gate_up, QType::Q4_G64_FP16) && row_split(down, QType::Q4_G64_FP16)) {
         require(gate_up.padded_shape[1] % 64 == 0 && down.padded_shape[1] % 64 == 0, "Q4 rows must hold whole groups");
-        launch<Q4>(x, ids, gate_up, down, top_k, hidden, intermediate, h, outputs, stream);
+        launch<Q4>(x, ids, gate_up, down, top_k, hidden, intermediate, h, outputs, stream, first_expert, local_experts);
     } else if (row_split(gate_up, QType::Q8_G32_FP16) && row_split(down, QType::Q8_G32_FP16)) {
         require(gate_up.padded_shape[1] % 32 == 0 && down.padded_shape[1] % 32 == 0, "Q8 rows must hold whole groups");
-        launch<Q8>(x, ids, gate_up, down, top_k, hidden, intermediate, h, outputs, stream);
+        launch<Q8>(x, ids, gate_up, down, top_k, hidden, intermediate, h, outputs, stream, first_expert, local_experts);
     } else {
         throw std::invalid_argument("resident_moe_experts: banks must be row-split Q4_G64_FP16 or Q8_G32_FP16");
     }

@@ -1,5 +1,6 @@
 #include "serve/serve_options.h"
 #include "product/speculative_options.h"
+#include "product/parallel_options.h"
 
 #include <cerrno>
 #include <cstdint>
@@ -197,6 +198,9 @@ std::string serve_usage_text(const char* argv0) {
            "                             (default 1); startup-fixed, extends the allowed\n"
            "                             ceiling only, not --max-context\n"
            "  --device N                 CUDA device ordinal (default 0)\n"
+           "  --parallel-devices IDS     experimental Flash-Next TP+EP, e.g. 0,1,2,3 (primary first)\n"
+           "  --pipeline-parallel        use TP2+PP2 on four GPUs (experimental)\n"
+           "  --fixed-kv-owners          keep all KV heads on first two TP4 GPUs\n"
            "  --ram-headroom-mib N       physical Host RAM in MiB that pinned weights and\n"
            "                             caches leave free for the system (default " +
            std::to_string(kDefaultRamHeadroomBytes >> 20) +
@@ -597,6 +601,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
+        } else if (arg == "--fixed-kv-owners") {
+            options.fixed_kv_owners = true;
+        } else if (arg == "--pipeline-parallel") {
+            options.pipeline_parallel = true;
+        } else if (arg == "--parallel-devices") {
+            options.parallel_devices = product::parse_parallel_devices(require_value("--parallel-devices"));
         } else if (arg == "--ram-headroom-mib") {
             const std::uint64_t mib = parse_u64(require_value("--ram-headroom-mib"), "ram-headroom-mib");
             if (mib > (std::numeric_limits<std::uint64_t>::max() >> 20)) {

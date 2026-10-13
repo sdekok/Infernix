@@ -47,6 +47,7 @@ other references own narrower contracts:
 | Document | Responsibility |
 |---|---|
 | [Engine architecture](maintainer/engine-architecture.md) | model/config/weight ownership, loading-to-execution flow, requests, scheduling, transactions and graphs |
+| [Flash-Next multi-GPU execution](maintainer/multi-gpu-5060-ti-design.md) | experimental GPU-owned text/MTP shards, expert ownership, numerical boundaries, restrictions and validation evidence |
 | [Build system](maintainer/build-system.md) | CMake targets, explicit source ownership, CUDA compilation boundaries, presets and developer configuration |
 | [Artifact container](maintainer/artifact-container.md) | v3 directory, objects, logical bindings, Uses, resources and file framing/sharding |
 | [Numeric formats](maintainer/tensor-formats.md) | represented values, codes/scales, conversion arithmetic and numerical interpretation |

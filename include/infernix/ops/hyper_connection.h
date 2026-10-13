@@ -62,4 +62,20 @@ void hyper_connection_inject(const Tensor& y, const Tensor& inject, Tensor& resi
 void hyper_connection_expand(const Tensor& x, std::int32_t streams, Tensor& residual,
                              cudaStream_t stream);
 
+// Finite TP composition of the same mixer. Down partitions retain the original
+// FP32 per-stream partials; up partitions own matching features in every stream.
+bool hyper_connection_fused_supported(const Weight& down, const Weight& up, int hidden,
+                                     int streams, int rank, int columns) noexcept;
+void hyper_connection_down_partition(const Tensor& residual, const Tensor& norm, const Weight& down,
+                                     float epsilon, void* partials, void* inverse_rms, cudaStream_t stream);
+void hyper_connection_up_partition(const Tensor& residual, const Tensor& norm, const Weight& up,
+                                   int down_rows, int rank, int first_feature, const void* partials,
+                                   const void* inverse_rms, Tensor& output, Tensor* inject, cudaStream_t stream);
+void hyper_connection_norm(const Tensor& residual, const Tensor& weight, int streams, float epsilon,
+                           Tensor& output, cudaStream_t stream);
+void hyper_connection_gates(const Tensor& z, int rank, int streams, Tensor& mix, Tensor* inject,
+                            cudaStream_t stream);
+void hyper_connection_collapse(const Tensor& logits, const Tensor& normalized, int streams,
+                               Tensor& output, cudaStream_t stream);
+
 } // namespace infernix::ops

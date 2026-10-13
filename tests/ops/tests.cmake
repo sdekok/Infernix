@@ -249,6 +249,9 @@ infernix_add_op_test(infernix_offloaded_moe_layer_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_layer.cu"
   LIBRARIES infernix_ops)
 
+add_test(NAME infernix_parallel_offloaded_moe_test COMMAND infernix_offloaded_moe_layer_test --multi-device)
+set_tests_properties(infernix_parallel_offloaded_moe_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+
 # The wide route (experts with more than eight columns) against its FP64 W4A4 oracle.
 infernix_add_op_test(infernix_offloaded_moe_wide_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_wide.cu"

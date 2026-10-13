@@ -1,0 +1,308 @@
+--- a/src/models/qwen4_exp/program/program_impl.h
++++ b/src/models/qwen4_exp/program/program_impl.h
+@@ -3,6 +3,7 @@
+ #include "models/qwen4_exp/execution/parallel.h"
+ 
+ #include "models/qwen4_exp/program/program.h"
++#include "models/qwen4_exp/program/draft_cost.h"
+ 
+ #include "core/arena.h"
+ #include "core/cuda_vmm.h"
+@@ -331,6 +332,7 @@
+     double vision_seconds = 0;
+     SpeculativeStats speculative;
+     std::array<double, 8> mtp_accept{};
++    std::array<double, 8> mtp_confidence{};
+     std::uint64_t mtp_policy_rounds = 0;
+     std::vector<ConstrainedDraw> constraint_trace;
+     ExpertResidency::Stats cache_at_admission;
+@@ -391,6 +393,7 @@
+         bool mtp_live           = false;
+         // Draft-length policy (design 11.3): conditional acceptance of each draft position.
+         std::array<double, 8> mtp_accept{};
++        std::array<double, 8> mtp_confidence{};
+         std::uint64_t mtp_policy_rounds = 0;
+         LanePrefix prefix;
+     };
+@@ -1216,6 +1219,7 @@
+         }
+         lane.next_call = 0;
+         lane.mtp_accept.fill(kAcceptancePrior);
++        lane.mtp_confidence.fill(1.0);
+         lane.mtp_policy_rounds = 0;
+         if (max_width_ > 1) {
+             if (options_.ngram_draft_tokens > 0) {
+@@ -1277,6 +1281,7 @@
+         r.vision_seconds          = lane.vision_seconds;
+         r.speculative             = lane.speculative;
+         r.mtp_accept              = lane.mtp_accept;
++        r.mtp_confidence          = lane.mtp_confidence;
+         r.mtp_policy_rounds       = lane.mtp_policy_rounds;
+         r.constraint_trace        = lane.constraint_trace;
+         r.cache_at_admission      = lane.cache_at_admission;
+@@ -1294,6 +1299,7 @@
+         lane.vision_seconds          = r.vision_seconds;
+         lane.speculative             = r.speculative;
+         lane.mtp_accept              = r.mtp_accept;
++        lane.mtp_confidence          = r.mtp_confidence;
+         lane.mtp_policy_rounds       = r.mtp_policy_rounds;
+         lane.constraint_trace        = r.constraint_trace;
+         lane.cache_at_admission      = r.cache_at_admission;
+@@ -1738,6 +1744,7 @@
+                         runtime::TokenMaskProvider* masks) {
+         const GrammarScope grammar(*this, masks);
+         const auto start = Clock::now();
++        collect_mtp_cost();
+         const auto batch = static_cast<std::int32_t>(sequences.size());
+         if (batch <= 0 || batch > static_cast<std::int32_t>(options_.max_concurrency)) {
+             throw std::logic_error("Qwen4Exp: decode batch is empty or too large");
+@@ -1800,6 +1807,15 @@
+             }
+             width = std::max(width, 1 + extents[b]);
+         }
++        if (mtp_ && parallel_ && batch <= 2) {
++            bool eligible = true;
++            for (int b = 0; b < batch; ++b) { eligible &= !from_ngram_[b] && extents[b] == steps; }
++            if (steps > 0) {
++                eligible &= mtp_draft_graphs_[static_cast<std::size_t>((batch - 1) * mtp_k_ + steps - 1)].executable.ready()
++                            || !options_.use_cuda_graph;
++            }
++            begin_mtp_cost(steps, batch, eligible);
++        }
+         // Columns of each verification row whose n-gram rows are already staged: the drafter's
+         // wait reads every committed-token column (the anchor's) and all of a copy row's.
+         std::array<std::int32_t, kMaximumConcurrency> staged{};
+@@ -1821,11 +1837,23 @@
+             // the drafter staged only column 0's n-gram rows; a pair round's columns are staged at
+             // their offsets, so it keeps its length.
+             if (batch == 1 && !from_ngram_[0] && extents[0] > 0) {
++                if (parallel_) {
++                    auto& confidence = lanes_[lanes[0]].mtp_confidence;
++                    for (int j = 0; j < extents[0]; ++j) {
++                        confidence[j] = .9 * confidence[j] + .1 * double(mtp_confident_[0] > j);
++                    }
++                }
+                 extents[0] = std::min(extents[0], mtp_confident_[0]);
+                 drafts_[0].resize(static_cast<std::size_t>(extents[0]));
+                 width = 1 + extents[0];
+             }
+         }
++        if (mtp_cost_.active) {
++            const bool ready = width > 1
++                ? verify_graphs_[static_cast<std::size_t>((batch - 1) * max_width_ + width - 1)].executable.ready()
++                : graphs_[static_cast<std::size_t>(batch - 1)].executable.ready();
++            mtp_cost_.active->eligible &= ready || !options_.use_cuda_graph;
++        }
+         if (width > 1) {
+             return verify(sequences, std::span<const std::uint32_t>(lanes.data(), batch),
+                           std::span<const std::int32_t>(positions.data(), batch), width,
+@@ -1991,6 +2019,7 @@
+             }
+         }
+         settle_round();
++        finish_mtp_cost();
+         for (std::size_t row = 0; row < rows.size(); ++row) {
+             if (decisions[row].cancelled) { release(ContractAccess::lane(rows[row])); }
+         }
+@@ -2738,6 +2767,18 @@
+     }
+ 
+     void release(std::uint32_t index) noexcept {
++        mtp_cost_.active = nullptr;
++        if (parallel_ && mtp_) {
++            for (std::size_t b = 0; b < mtp_cost_.models.size(); ++b) {
++                const auto& estimates = mtp_cost_.models[b].estimates();
++                for (int k = 0; k <= mtp_k_; ++k) {
++                    if (estimates[k].samples) {
++                        std::fprintf(stderr, "[mtp-cost] rows=%zu drafts=%d round_ms=%.4f samples=%llu\n",
++                            b + 1, k, estimates[k].milliseconds, static_cast<unsigned long long>(estimates[k].samples));
++                    }
++                }
++            }
++        }
+         Lane& lane = lanes_[index];
+         if (walk_.active && walk_.lane == index) { walk_abandon(); }
+         if (stream_lease_.valid() && !prefilling_besides(index)) {
+@@ -3597,6 +3638,7 @@
+             }
+         }
+         settle_round();
++        finish_mtp_cost();
+         for (std::int32_t row = 0; row < batch; ++row) {
+             if (decisions[static_cast<std::size_t>(row)].cancelled) { release(ContractAccess::lane(rows[row])); }
+         }
+@@ -3606,6 +3648,36 @@
+         return out;
+     }
+ 
++    void collect_mtp_cost() {
++        for (auto& sample : mtp_cost_.samples) {
++            if (!sample.pending) { continue; }
++            const auto status = cudaEventQuery(sample.end);
++            if (status == cudaErrorNotReady) { continue; }
++            CUDA_CHECK(status);
++            float ms = 0; CUDA_CHECK(cudaEventElapsedTime(&ms, sample.begin, sample.end));
++            if (sample.eligible) { mtp_cost_.models[sample.batch - 1].observe(sample.drafts, ms); }
++            sample.pending = false;
++        }
++    }
++    void begin_mtp_cost(int drafts, int batch, bool eligible) {
++        // A discarded round has no completed observation. Reuse its slot only in
++        // stream order; never wait for a cost sample on the critical path.
++        mtp_cost_.active = nullptr;
++        for (auto& sample : mtp_cost_.samples) {
++            if (sample.pending) { continue; }
++            if (!sample.begin) { CUDA_CHECK(cudaEventCreate(&sample.begin)); }
++            if (!sample.end) { CUDA_CHECK(cudaEventCreate(&sample.end)); }
++            sample.drafts = drafts; sample.batch = batch; sample.eligible = eligible;
++            CUDA_CHECK(cudaEventRecord(sample.begin, device_.stream));
++            mtp_cost_.active = &sample; return;
++        }
++    }
++    void finish_mtp_cost() {
++        if (auto* sample = std::exchange(mtp_cost_.active, nullptr)) {
++            CUDA_CHECK(cudaEventRecord(sample->end, device_.stream)); sample->pending = true;
++        }
++    }
++
+     // ---------------------------------------------------------------- MTP drafter (design 11.2)
+     void allocate_mtp(std::int32_t lanes, std::uint64_t& allocated) {
+         const std::size_t column = plan_.mtp_column_bytes;
+@@ -3696,6 +3768,17 @@
+     // kProbeInterval rounds a row drafts one token more than its choice, so the estimate of the
+     // next position stays current (K = 0 then probes one draft).
+     std::int32_t choose_draft_length(Lane& lane) const {
++        if (parallel_) {
++            std::array<double, 9> expected{}; expected[0] = 1;
++            double reach = 1, confidence = 1;
++            for (int k = 1; k <= mtp_k_; ++k) {
++                reach *= lane.mtp_accept[k - 1];
++                confidence = std::min(confidence, lane.mtp_confidence[k - 1]);
++                expected[k] = expected[k - 1] + reach * confidence;
++            }
++            return mtp_cost_.models[0].choose(std::span(expected).first(mtp_k_ + 1),
++                                              kWidthCost, lane.mtp_policy_rounds++);
++        }
+         std::int32_t best = 0;
+         double best_score = 1.0;
+         double reach = 1.0, tokens = 1.0;
+@@ -3719,6 +3802,16 @@
+     std::int32_t choose_pair_draft_length(const Lane& a, const Lane& b) {
+         if (!a.mtp_live || !b.mtp_live) { return 0; }
+         const std::int32_t most = std::min(kPairMaxDrafts, mtp_k_);
++        if (parallel_) {
++            std::array<double, 9> expected{}; expected[0] = 2;
++            double reach_a = 1, reach_b = 1;
++            for (int k = 1; k <= most; ++k) {
++                reach_a *= a.mtp_accept[k - 1]; reach_b *= b.mtp_accept[k - 1];
++                expected[k] = expected[k - 1] + reach_a + reach_b;
++            }
++            return mtp_cost_.models[1].choose(std::span(expected).first(most + 1),
++                                              kPairWidthCost, pair_policy_rounds_++);
++        }
+         std::int32_t best = 0;
+         double best_score = 2.0;
+         double reach_a = 1.0, reach_b = 1.0, tokens = 2.0;
+@@ -4536,6 +4629,17 @@
+     std::vector<TokenId> pending_tokens_ = std::vector<TokenId>(kMaximumConcurrency, 0);
+     std::array<std::int32_t, kMaximumConcurrency> pending_counts_{};
+ 
++    struct MtpCost {
++        struct Sample {
++            cudaEvent_t begin = nullptr, end = nullptr;
++            int drafts = 0, batch = 1;
++            bool pending = false, eligible = false;
++            ~Sample() { if (begin) { cudaEventDestroy(begin); } if (end) { cudaEventDestroy(end); } }
++        };
++        std::array<Sample, 4> samples;
++        Sample* active = nullptr;
++        std::array<DraftCostModel, 2> models;
++    } mtp_cost_;
+     // MTP drafter.
+     bool mtp_            = false;
+     std::int32_t mtp_k_  = 0;
+--- a/src/models/qwen4_exp/program/draft_cost.h
++++ b/src/models/qwen4_exp/program/draft_cost.h
+@@ -0,0 +1,51 @@
++#pragma once
++#include <array>
++#include <cmath>
++#include <cstdint>
++#include <span>
++#include <stdexcept>
++namespace infernix::models::qwen4_exp {
++// Program policy: measured end-to-end draft/verify/commit intervals on this host.
++// Each row count has its own model. Initial costs retain the established prior;
++// completed steady-state observations replace it, without synchronizing a GPU.
++class DraftCostModel {
++public:
++    struct Estimate { double milliseconds = 0; std::uint64_t samples = 0; };
++    void observe(int drafts, double milliseconds) {
++        if (drafts < 0 || drafts > 8 || !(milliseconds > 0) || !std::isfinite(milliseconds)) {
++            throw std::invalid_argument("invalid MTP round cost observation");
++        }
++        auto& e = costs_[drafts];
++        e.milliseconds = e.samples ? e.milliseconds * .8 + milliseconds * .2 : milliseconds;
++        ++e.samples;
++    }
++    double cost(int drafts, double prior_slope) const {
++        if (costs_[drafts].samples) { return costs_[drafts].milliseconds; }
++        double base = costs_[0].milliseconds;
++        if (!costs_[0].samples) {
++            base = 1;
++            for (int k = 1; k <= 8; ++k) {
++                if (costs_[k].samples) { base = costs_[k].milliseconds / (1 + prior_slope * k); break; }
++            }
++        }
++        return base * (1 + prior_slope * drafts);
++    }
++    int choose(std::span<const double> expected_tokens, double prior_slope, std::uint64_t round) const {
++        if (expected_tokens.empty() || expected_tokens.size() > 9) { throw std::invalid_argument("invalid MTP candidates"); }
++        const int count = expected_tokens.size();
++        // Warm each legal width, then probe one width periodically. This includes
++        // K=0: an expensive drafter must be able to learn plain decoding's cost.
++        if (round < std::uint64_t(count * 2)) { return round % count; }
++        if (round % 32 == 0) { return (round / 32) % count; }
++        int best = 0; double score = expected_tokens[0] / cost(0, prior_slope);
++        for (int k = 1; k < count; ++k) {
++            const double candidate = expected_tokens[k] / cost(k, prior_slope);
++            if (candidate > score) { score = candidate; best = k; }
++        }
++        return best;
++    }
++    const std::array<Estimate, 9>& estimates() const noexcept { return costs_; }
++private:
++    std::array<Estimate, 9> costs_{};
++};
++}
+--- a/tests/test_draft_cost.cpp
++++ b/tests/test_draft_cost.cpp
+@@ -0,0 +1,20 @@
++#include "models/qwen4_exp/program/draft_cost.h"
++#include <array>
++#include <stdexcept>
++using infernix::models::qwen4_exp::DraftCostModel;
++void require(bool pass) { if (!pass) { throw std::runtime_error("draft cost policy selection failed"); } }
++int main() {
++    DraftCostModel m;
++    const std::array<double,4> yield{1,1.8,2.4,2.8};
++    m.observe(0,10);m.observe(1,13);m.observe(2,15);m.observe(3,18);
++    require(m.choose(yield,.38,15)==2);
++    for (int k=1;k<=3;++k) for(int j=0;j<40;++j)m.observe(k,40);
++    require(m.choose(yield,.38,15)==0);
++    for (int k=1;k<=3;++k)for(int j=0;j<40;++j)m.observe(k,10+k);
++    require(m.choose(yield,.38,15)==3);
++    std::array<bool,4> visited{};for(unsigned r=0;r<8;++r)visited[m.choose(yield,.38,r)]=true;
++    for(bool x:visited)require(x);
++    visited={};for(unsigned r=32;r<=128;r+=32)visited[m.choose(yield,.38,r)]=true;
++    for(bool x:visited)require(x);
++    const std::array<double,4> rejection{1,1,1,1};require(m.choose(rejection,.38,15)==0);
++}
+--- a/tests/cmake/CoreTests.cmake
++++ b/tests/cmake/CoreTests.cmake
+@@ -121,3 +121,5 @@
+   LIBRARIES infernix_model_runtime)
+ set_tests_properties(infernix_parallel_expert_stream_test PROPERTIES
+   SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;multi-gpu")
++
++infernix_add_test(infernix_draft_cost_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_draft_cost.cpp" LIBRARIES infernix_core)

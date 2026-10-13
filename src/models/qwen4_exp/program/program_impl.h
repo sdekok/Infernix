@@ -1,5 +1,7 @@
 #pragma once
 
+#include "models/qwen4_exp/execution/parallel.h"
+
 #include "models/qwen4_exp/program/program.h"
 
 #include "core/arena.h"
@@ -8,6 +10,9 @@
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include "core/gdn_replay_records.h"
+#include "core/host_worker_pool.h"
+#include "models/qwen4_exp/parallel_kv.h"
+#include "models/qwen4_exp/execution/parallel_state.h"
 #include "core/layout.h"
 #include "core/link_probe.h"
 #include "core/linear_attention_state.h"
@@ -254,6 +259,10 @@ struct MtpIo {
 // (ProgramImpl::plan_device) computes it from the options and the configuration alone: before the
 // weights are read, for the startup check, and in the constructor, which allocates exactly it.
 struct DeviceLayout {
+    std::size_t kv_chunk_bytes = 2ULL << 20;
+    std::vector<int> kv_owners;
+    std::vector<int> window_owners;
+    std::size_t window_local = 0;
     std::int32_t lanes = 0, token_domain = 0, head_rows = 0, chunk = 0, mtp_k = 0, max_width = 1, columns = 0,
                  pages_per_row = 0, mtp_columns = 0;
     bool mtp = false;
@@ -325,6 +334,7 @@ struct ResumeStateImpl {
     std::uint64_t mtp_policy_rounds = 0;
     std::vector<ConstrainedDraw> constraint_trace;
     ExpertResidency::Stats cache_at_admission;
+    std::vector<ExpertResidency::OwnerStats> owner_cache_at_admission;
     std::uint64_t cpu_served_at_admission = 0;
     NgramVolume::Counters ngram;
     GateTraffic gate;
@@ -366,6 +376,7 @@ public:
         std::uint64_t decode_ns       = 0;
         std::uint64_t decode_share_ns = 0;
         ExpertResidency::Stats cache_at_admission;
+        std::vector<ExpertResidency::OwnerStats> owner_cache_at_admission;
         std::uint64_t cpu_served_at_admission = 0;
         HostExpertTier::Stats tier_at_admission{}; // SSD tier mode
         NgramVolume::Counters ngram; // this request's n-gram row traffic
@@ -421,6 +432,10 @@ public:
         const std::int32_t lanes = d.lanes, W = d.max_width;
         // One copy-on-write page per lane, so a whole-extent resume always fits (design §19.3.1).
         if (o.prefix_cache) { d.kv_pages += static_cast<std::uint32_t>(lanes); }
+        const bool parallel = !o.parallel_devices.empty();
+        if (parallel) {
+            d.kv_chunk_bytes = kParallelStateChunk;
+        }
         const std::size_t width = c.residual_width(), di = c.qsa.index_head_dim, r = c.qsa.compress_ratio;
 
         // Recurrent state: one slot per lane; the PLE history; one QSA tail slab per attention
@@ -439,18 +454,33 @@ public:
         d.ple       = width * c.ple.conv_span() * lanes * 2;
         d.kv_layers = c.attention_layers + (d.mtp ? 1U : 0U);
         d.tails     = d.kv_layers * di * (r - 1) * lanes * 2;
-        d.window    = prefix::kv_window_geometry(c, o.kv_cache, d.mtp, static_cast<std::uint32_t>(lanes)).bytes();
+        const auto window = prefix::kv_window_geometry(c, o.kv_cache, d.mtp, static_cast<std::uint32_t>(lanes), parallel);
+        d.window = d.window_local = window.bytes();
+        if (parallel && window.present()) {
+            d.window_owners.resize(d.window / kParallelStateChunk);
+            for (unsigned l = 0; l < window.kv_layers; ++l) for (int p = 0; p < 5; ++p) {
+                for (int h = 0; h < window.kv_heads; ++h) {
+                    const auto start = (window.plane_offset(l, p) + h * window.head_stride(p)) / kParallelStateChunk;
+                    std::fill_n(d.window_owners.begin() + start, window.head_stride(p) / kParallelStateChunk,
+                                attention_head_owner(l, h, window.kv_heads, o.parallel_devices.size(), o.pipeline_parallel, o.fixed_kv_owners));
+                }
+            }
+            d.window_local = std::count(d.window_owners.begin(), d.window_owners.end(), 0) * kParallelStateChunk;
+        }
 
         // Paged KV: one page group holds 64 positions of every attention layer.
         // The page group's planes, in the order the prefix cache's records also use.
-        const prefix::KvPageGeometry kv_geometry = prefix::kv_page_geometry(c, o.kv_cache, d.mtp);
+        const prefix::KvPageGeometry kv_geometry = prefix::kv_page_geometry(c, o.kv_cache, d.mtp, parallel);
         LayoutBuilder kv_builder;
         d.pool   = plan_device_kv_page_pool(kv_builder, {.page_group_count = d.kv_pages, .geometry = kv_geometry.geometry});
         d.tables = plan_kv_execution_tables(
             kv_builder, {.logical_page_capacity = static_cast<std::uint32_t>(d.pages_per_row), .table_rows = lanes});
         d.kv = kv_builder.finish(256);
+        if (parallel) {
+            d.kv_owners = parallel_kv_owners(d.pool, d.kv, kv_geometry.planes_per_layer, o.parallel_devices.size(), o.pipeline_parallel, o.fixed_kv_owners);
+        }
         // Pages [0, n) are a prefix of each page-major plane, so growth maps whole chunks at each plane's end.
-        d.kv_elastic = d.pool.spec.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor;
+        d.kv_elastic = parallel || d.pool.spec.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor;
         d.kv_base_pages = std::min<std::uint32_t>(d.kv_pages, kKvBaseTokens / kPagedKVPageSize);
 
         // Per-call inputs, logits and sampling counts.
@@ -548,10 +578,11 @@ public:
         auto& b     = d.bytes;
         b.kv_pages  = d.kv_pages;
         b.kv        = d.kv_elastic ? kv_mapped_bytes(d, d.kv_base_pages) : d.kv;
-        b.kv_max    = d.kv;
-        b.workspace = d.work;
+        b.kv_max    = parallel ? kv_mapped_bytes(d, d.kv_pages) : d.kv;
+        b.workspace = d.work + (o.pipeline_parallel ? std::max(d.work, d.wide_work) : 0);
         b.staging   = d.staging;
-        b.state     = d.gdn_bytes + d.ple + d.tails + d.window + d.records_bytes + d.ple_records + d.qsa_records +
+        b.state     = (parallel ? execution::ParallelGdnState::planned_bytes(c, o.parallel_devices.size(), 0, lanes, W, o.pipeline_parallel)
+                               : d.gdn_bytes + d.records_bytes) + d.ple + d.tails + d.window_local + d.ple_records + d.qsa_records +
                   (d.mtp ? d.mtp_column_bytes * lanes * (W + 2) + 2ULL * di * W * lanes : 0);
         b.io = d.io.bytes + d.logits32 + d.logits16 + 4ULL * lanes + 4ULL * lanes +
                sizeof(ops::SamplingConfig) * lanes + d.token_counts + 4ULL * d.spec.words + d.mtp_ones +
@@ -560,28 +591,39 @@ public:
         b.residency            = ExpertResidency::table_bytes(c, d.columns);
         b.expert_record_stride = d.record_stride;
         b.max_frames           = ExpertResidency::max_frames(c);
-        b.graph_bound          = graph_bound(o.max_concurrency, static_cast<std::uint32_t>(W),
-                                             static_cast<std::uint32_t>(d.mtp_k));
+        b.graph_bound          = o.use_cuda_graph ? graph_bound(o.max_concurrency, static_cast<std::uint32_t>(W),
+                                             static_cast<std::uint32_t>(d.mtp_k)) : 0;
         return d;
     }
 
     // The chunks of the KV backing that pages [0, pages) of every plane and the block tables need.
     static std::vector<std::uint8_t> kv_chunks(const DeviceLayout& d, std::uint32_t pages) {
-        std::vector<std::uint8_t> need((d.kv + kKvChunkBytes - 1) / kKvChunkBytes, 0);
+        const auto chunk = d.kv_chunk_bytes;
+        std::vector<std::uint8_t> need((d.kv + chunk - 1) / chunk, 0);
         const auto mark = [&](std::size_t offset, std::size_t bytes) {
             if (bytes == 0) { return; }
-            for (std::size_t c = offset / kKvChunkBytes; c <= (offset + bytes - 1) / kKvChunkBytes; ++c) { need[c] = 1; }
+            for (std::size_t c = offset / chunk; c <= (offset + bytes - 1) / chunk; ++c) { need[c] = 1; }
         };
         for (const auto& plane : d.pool.planes) { // page-major: the page is the outermost dimension
             const auto total = static_cast<std::size_t>(d.pool.spec.page_group_count);
-            mark(plane.storage.region.offset, plane.storage.region.bytes / total * pages);
+            if (d.pool.spec.geometry.device_plane_order == PagedKVPlaneOrder::HeadMajor) {
+                const auto head_bytes = plane.storage.region.bytes / plane.geometry.head_extent;
+                for (int head = 0; head < plane.geometry.head_extent; ++head) {
+                    const auto page_bytes = std::size_t(plane.geometry.leading_extent) * kPagedKVPageSize * dtype_size(plane.geometry.dtype);
+                    mark(plane.storage.region.offset + head * head_bytes, page_bytes * pages);
+                }
+            } else { mark(plane.storage.region.offset, plane.storage.region.bytes / total * pages); }
         }
         mark(d.tables.block_tables.region.offset, d.tables.block_tables.region.bytes);
         return need;
     }
-    static std::size_t kv_mapped_bytes(const DeviceLayout& d, std::uint32_t pages) {
+    static std::size_t kv_mapped_bytes(const DeviceLayout& d, std::uint32_t pages, int rank = 0) {
         const auto need = kv_chunks(d, pages);
-        return static_cast<std::size_t>(std::count(need.begin(), need.end(), std::uint8_t{1})) * kKvChunkBytes;
+        std::size_t bytes = 0;
+        for (std::size_t i = 0; i < need.size(); ++i) {
+            if (need[i] && (d.kv_owners.empty() || d.kv_owners[i] == rank)) { bytes += d.kv_chunk_bytes; }
+        }
+        return bytes;
     }
 
     // The workspace arena of a Program with `lanes` lanes and the plan's widths: the forward at its
@@ -648,26 +690,43 @@ public:
         guard.begin();
         std::uint64_t allocated = 0;
 
-        allocate(state_backing_, plan_.gdn_bytes, allocated);
-        state_backing_.fill(0);
-        gdn_ = std::make_unique<LinearAttentionStatePool>(DeviceSpan{state_backing_.p, state_backing_.bytes}, plan_.gdn);
+        if (options_.parallel_devices.empty()) {
+            allocate(state_backing_, plan_.gdn_bytes, allocated);
+            state_backing_.fill(0);
+            gdn_ = std::make_unique<LinearAttentionStatePool>(DeviceSpan{state_backing_.p, state_backing_.bytes}, plan_.gdn);
+        } else {
+            parallel_gdn_ = std::make_unique<execution::ParallelGdnState>(c_, options_.parallel_devices, lanes, max_width_, options_.pipeline_parallel);
+            allocated += parallel_gdn_->bytes(0);
+        }
         allocate(ple_backing_, plan_.ple, allocated);
         ple_backing_.fill(0);
         allocate(tails_backing_, plan_.tails, allocated);
         tails_backing_.fill(0);
         window_geometry_ = prefix::kv_window_geometry(c_, options_.kv_cache, mtp_,
-                                                      static_cast<std::uint32_t>(options_.max_concurrency));
+                                                      static_cast<std::uint32_t>(options_.max_concurrency),
+                                                      !options_.parallel_devices.empty());
         if (window_geometry_.present()) {
-            allocate(window_backing_, plan_.window, allocated);
-            window_backing_.fill(0); // zero tags never match a row's (tags are odd)
+            if (plan_.window_owners.empty()) {
+                allocate(window_backing_, plan_.window, allocated);
+                window_backing_.fill(0);
+            } else {
+                window_vmm_ = std::make_unique<VmmRange>(device_.device, plan_.window, kParallelStateChunk);
+                for (std::size_t i = 0; i < plan_.window_owners.size(); ++i) {
+                    if (!window_vmm_->map(i, options_.parallel_devices[plan_.window_owners[i]], options_.parallel_devices)) {
+                        throw std::runtime_error("parallel KV exact window does not fit on its owner");
+                    }
+                }
+                CUDA_CHECK(cudaMemsetAsync(window_vmm_->base(), 0, plan_.window, device_.stream));
+                allocated += plan_.window_local;
+            }
         }
 
-        kv_geometry_ = prefix::kv_page_geometry(c_, options_.kv_cache, mtp_);
+        kv_geometry_ = prefix::kv_page_geometry(c_, options_.kv_cache, mtp_, !options_.parallel_devices.empty());
         if (plan_.kv_elastic) {
-            kv_vmm_  = std::make_unique<VmmRange>(device_.device, plan_.kv, kKvChunkBytes);
+            kv_vmm_  = std::make_unique<VmmRange>(device_.device, plan_.kv, plan_.kv_chunk_bytes);
             kv_span_ = DeviceSpan{kv_vmm_->base(), plan_.kv};
             if (!map_kv(plan_.kv_base_pages)) { throw std::runtime_error("Qwen4Exp: the KV pool's base pages do not fit"); }
-            allocated += kv_vmm_->mapped_bytes();
+            allocated += kv_vmm_->mapped_bytes(device_.device);
         } else {
             allocate(kv_backing_, plan_.kv, allocated);
             kv_backing_.fill(0);
@@ -698,7 +757,8 @@ public:
         publish_pinned_word(gate_ready(), 0); // pinned memory starts undefined; 0 is never a round's word
 
         execution::ForwardState state;
-        state.gdn      = gdn_.get();
+        state.gdn      = parallel_gdn_ ? parallel_gdn_->shards.front().state.get() : gdn_.get();
+        state.parallel_gdn = parallel_gdn_.get();
         state.ple_conv = Tensor(ple_backing_.p, DType::BF16, {width_, span_, lanes});
         for (std::uint32_t l = 0; l < c_.attention_layers; ++l) {
             state.qsa_tails.push_back(Tensor(static_cast<std::byte*>(tails_backing_.p) +
@@ -721,7 +781,8 @@ public:
             layer.kv.v_pages = pool_->plane(plane++);
             if (layout.value.has_scale()) { layer.kv.v_scale_pages = pool_->plane(plane++); }
             layer.pooled_pages = pool_->plane(plane++);
-            if (window_geometry_.present()) { layer.kv.window = prefix::kv_window_view(window_geometry_, window_backing_.p, l); }
+            if (!options_.parallel_devices.empty()) { layer.pooled_pages = parallel_kv_head(layer.pooled_pages, 0); }
+            if (window_geometry_.present()) { layer.kv.window = prefix::kv_window_view(window_geometry_, window_base(), l); }
             if (plane != planes.end) { throw std::logic_error("Qwen4Exp: KV planes do not match the page geometry"); }
             if (l < c_.attention_layers) {
                 kv.layers.push_back(layer);
@@ -743,6 +804,12 @@ public:
         wide_work_     = plan_.wide_work;
         work_          = std::make_unique<WorkspaceArena>(work_capacity_);
         allocated += work_capacity_;
+        if (options_.pipeline_parallel) {
+            pipeline_work_ = std::make_unique<WorkspaceArena>(std::max(plan_.work, plan_.wide_work));
+            allocated += pipeline_work_->capacity();
+            CUDA_CHECK(cudaEventCreateWithFlags(&pipeline_ready_, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&pipeline_done_, cudaEventDisableTiming));
+        }
 
         // The promotions' copy sources: the banks where the device reads them (cudaMemcpyBatchAsync
         // faults on a registered block's host address where the device maps it elsewhere: WDDM).
@@ -821,7 +888,9 @@ public:
                 for (const auto& layer : parameters_.layers) {
                     banks.push_back(reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.device_records));
                 }
-                record_of = [banks = std::move(banks), record_stride](std::uint32_t layer, std::uint32_t expert) {
+                const auto owners = std::max<std::size_t>(1, options_.parallel_devices.size());
+                record_of = [banks = std::move(banks), record_stride, owners, pipeline = options_.pipeline_parallel, layers = c_.num_hidden_layers, experts = c_.moe.experts](std::uint32_t layer, std::uint32_t expert) -> const std::uint8_t* {
+                    if (parallel_expert_owner(layer, expert, experts, layers, owners, pipeline) != 0) { return nullptr; }
                     return banks[layer] + static_cast<std::size_t>(expert) * record_stride;
                 };
             }
@@ -876,6 +945,15 @@ public:
             }
         }
         create_prefix_cache();
+
+        if (!options_.parallel_devices.empty()) {
+            parallel_ = std::make_unique<execution::ParallelExecution>(parameters_, device_,
+                options_.parallel_devices, columns_, plan_.bytes.graph_bound, options_.vram_headroom,
+                options_.max_context, options_.kv_cache, std::max(lanes * max_width_, 8));
+            parallel_->attach_caches(*residency_);
+            experts.parallel = parallel_.get();
+            if (options_.use_cuda_graph) { ngram_reader_ = std::make_unique<HostWorkerPool>(1, 1); }
+        }
 
         // The VRAM expert cache takes what the fixed allocations, the reserve for graph
         // executables and the display headroom leave (design §19.3.7). Its frames are the one
@@ -936,6 +1014,8 @@ public:
         device_.synchronize();
         report_lane_cost(lanes, record_stride);
     }
+
+    ~ProgramImpl() { if (parallel_) { try { parallel_->synchronize_pipeline(); } catch (...) {} } if (pipeline_ready_) { cudaEventDestroy(pipeline_ready_); } if (pipeline_done_) { cudaEventDestroy(pipeline_done_); } }
 
     const DeviceLayout& device_layout() const noexcept { return plan_; }
     const VramSizing& vram_sizing() const noexcept { return sizing_; }
@@ -1170,6 +1250,7 @@ public:
         lane.decode_ns       = 0;
         lane.decode_share_ns = 0;
         lane.cache_at_admission = residency_->stats();
+        lane.owner_cache_at_admission = residency_->owner_stats();
         lane.cpu_served_at_admission = cpu_service_ ? cpu_service_->served_experts() : 0;
         if (tier_) { lane.tier_at_admission = tier_->stats(); }
         lane.ngram                   = {};
@@ -1207,6 +1288,7 @@ public:
         r.mtp_policy_rounds       = lane.mtp_policy_rounds;
         r.constraint_trace        = lane.constraint_trace;
         r.cache_at_admission      = lane.cache_at_admission;
+        r.owner_cache_at_admission = lane.owner_cache_at_admission;
         r.cpu_served_at_admission = lane.cpu_served_at_admission;
         r.ngram                   = lane.ngram;
         r.gate                    = lane.gate;
@@ -1223,6 +1305,7 @@ public:
         lane.mtp_policy_rounds       = r.mtp_policy_rounds;
         lane.constraint_trace        = r.constraint_trace;
         lane.cache_at_admission      = r.cache_at_admission;
+        lane.owner_cache_at_admission = r.owner_cache_at_admission;
         lane.cpu_served_at_admission = r.cpu_served_at_admission;
         lane.ngram                   = r.ngram;
         lane.gate                    = r.gate;
@@ -1761,7 +1844,8 @@ public:
         plain_round_ = true;
         const std::span<const std::uint32_t> round_lanes(lanes.data(), static_cast<std::size_t>(batch));
         const std::span<const std::int32_t> round_positions(positions.data(), static_cast<std::size_t>(batch));
-        // A replayed round reads its rows after the launch, while the GPU embeds and runs layer 0,
+        // A replayed round overlaps its row reads with embedding and layer 0;
+        // multi-device graphs start an independent reader before launch,
         // and releases them to the gate before ple_embed (design §12.3, n-gram S4b); a round that
         // warms or captures its graph reads them first.
         // A round whose rows are all in the host cache reads nothing, so it stages them first.
@@ -1773,12 +1857,18 @@ public:
             stage_decode_rows(round_lanes, round_positions);
             publish_pinned_word(gate_ready(), word);
         }
+        PendingNgramRead reading;
+        if (gated && ngram_reader_) {
+            reading.future = start_ngram_read(lanes_[lanes[0]], word, io_prefix(batch) - io_layout_.ngram,
+                [&] { stage_decode_rows(round_lanes, round_positions); });
+        }
         run_decode(batch);
-        GateRelease release_gate{gated ? this : nullptr, word, io_prefix(batch) - io_layout_.ngram};
+        GateRelease release_gate{gated && !reading.future.valid() ? this : nullptr, word, io_prefix(batch) - io_layout_.ngram};
         for (std::int32_t b = 0; b < batch; ++b) { ++lanes_[lanes[b]].state_tokens; }
         sample(round_lanes, round_positions, [&] {
             if (!gated) { return; }
-            read_behind_gate(lanes_[lanes[0]], word, [&] { stage_decode_rows(round_lanes, round_positions); });
+            if (reading.future.valid()) { report_gated_read(reading.future.get()); }
+            else { read_behind_gate(lanes_[lanes[0]], word, [&] { stage_decode_rows(round_lanes, round_positions); }); }
             release_gate.owner = nullptr;
         });
         deferred_ = {.columns = batch, .tokens = 1, .live = false, .pending = true};
@@ -1825,6 +1915,7 @@ public:
             residency_->after_round(device_.stream, static_cast<std::int32_t>(stride), kDecodePromotionsPerLayer);
             apply_vram_target(false);
             lane.state_tokens += stride;
+            if (!prefilling_besides(index)) { return_wide_work(); }
         }
         runtime::ExecutionTiming timing;
         timing.submit_host_ns = elapsed_ns(start);
@@ -1950,9 +2041,15 @@ public:
             out.speculative       = lanes_[index].speculative;
             out.constrained_draws = std::move(lanes_[index].constraint_trace);
             if (residency_) {
-                const auto& s = residency_->stats();
-                const auto& a = lanes_[index].cache_at_admission;
-                out.expert_cache = ExpertCacheStats{.routed = s.routed - a.routed, .hits = s.hits - a.hits};
+                ExpertCacheStats total{};
+                const auto owners = residency_->owner_stats();
+                for (std::size_t i = 0; i < owners.size(); ++i) {
+                    const auto& s = owners[i].counters;
+                    const auto& a = lanes_[index].owner_cache_at_admission.at(i).counters;
+                    total.routed += s.routed - a.routed;
+                    total.hits += s.hits - a.hits;
+                }
+                out.expert_cache = total;
             }
             report_cache(lanes_[index]);
             report_ngram(lanes_[index]);
@@ -2040,7 +2137,7 @@ public:
         out.kv_capacity_page_groups = kv_pages_;
         out.kv_capacity_max_page_groups = kv_pages_;
         out.kv_cache                = options_.kv_cache;
-        out.kv_payload_bytes        = kv_vmm_ ? kv_vmm_->mapped_bytes() : kv_backing_.bytes;
+        out.kv_payload_bytes        = kv_vmm_ ? kv_vmm_->mapped_bytes(device_.device) : kv_backing_.bytes;
         out.workspace_logical_peak_bytes = work_capacity_;
         return out;
     }
@@ -2428,6 +2525,21 @@ private:
     // or on stderr without an observer.
     void report_cache(const Lane& lane) noexcept {
         try {
+            const auto owners = residency_->owner_stats();
+            if (owners.size() > 1) {
+                for (std::size_t i = 0; i < owners.size(); ++i) {
+                    const auto& owner = owners[i];
+                    const auto& before = lane.owner_cache_at_admission.at(i).counters;
+                    const auto routed = owner.counters.routed - before.routed;
+                    const auto hits = owner.counters.hits - before.hits;
+                    char line[256];
+                    std::snprintf(line, sizeof(line),
+                        "GPU %d expert cache: %u frames; request %llu routed, %llu hits, %llu misses, %.2f%% hit",
+                        owner.device, owner.frames, (unsigned long long)routed, (unsigned long long)hits,
+                        (unsigned long long)(routed - hits), routed ? 100.0 * double(hits) / routed : 0.0);
+                    diagnostic(line, DiagnosticLevel::Debug);
+                }
+            }
             const auto& at_admission = lane.cache_at_admission;
             const auto& s       = residency_->stats();
             const auto routed   = s.routed - at_admission.routed;
@@ -2574,6 +2686,24 @@ private:
         }
     };
 
+    // A graph launch spanning devices can block the calling host thread. Its
+    // mapped n-gram gate must therefore be released by independent host work.
+    // A round joins before its captured references or staging storage can change.
+    struct PendingNgramRead {
+        std::future<std::uint64_t> future;
+        ~PendingNgramRead() { if (future.valid()) { future.wait(); } }
+    };
+
+    std::future<std::uint64_t> start_ngram_read(Lane& lane, std::uint32_t word, std::size_t bytes,
+                                     std::function<void()> read) {
+        return ngram_reader_->submit([this, &lane, word, bytes, read = std::move(read)] {
+            GateRelease release{this, word, bytes}; // release even on an I/O failure
+            const auto elapsed = read_and_release_gate(lane, word, read);
+            release.owner = nullptr;
+            return elapsed;
+        });
+    }
+
     // A diagnostic (Info unless stated) for the Engine's observer, or stderr without one.
     void diagnostic(const std::string& text, DiagnosticLevel level = DiagnosticLevel::Info) const noexcept {
         try {
@@ -2673,7 +2803,8 @@ private:
     // penalty counts.
     void reset_slot(std::uint32_t slot) {
         const cudaStream_t s = device_.stream;
-        for (std::uint32_t l = 0; l < c_.gdn_layers; ++l) {
+        if (parallel_gdn_) { parallel_->reset_gdn(*parallel_gdn_, slot); }
+        else for (std::uint32_t l = 0; l < c_.gdn_layers; ++l) {
             Tensor conv      = gdn_->conv_slot(l, static_cast<std::int32_t>(slot));
             Tensor recurrent = gdn_->recurrent_slot(l, static_cast<std::int32_t>(slot));
             CUDA_CHECK(cudaMemsetAsync(conv.data, 0, conv.bytes(), s));
@@ -2688,9 +2819,13 @@ private:
                                        tail_bytes, s));
             if (window_geometry_.present()) { // the window's tags: no earlier history's row is read
                 const std::size_t tags = window_geometry_.lane_bytes(4);
-                CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(window_backing_.p) +
-                                               window_geometry_.plane_offset(l, 4) + slot * tags,
-                                           0, tags, s));
+                auto* base = static_cast<std::byte*>(window_base()) + window_geometry_.plane_offset(l, 4);
+                if (window_geometry_.head_major) {
+                    const auto part = tags / window_geometry_.kv_heads;
+                    for (int head = 0; head < window_geometry_.kv_heads; ++head) {
+                        CUDA_CHECK(cudaMemsetAsync(base + head * window_geometry_.head_stride(4) + slot * part, 0, part, s));
+                    }
+                } else { CUDA_CHECK(cudaMemsetAsync(base + slot * tags, 0, tags, s)); }
             }
         }
         CUDA_CHECK(cudaMemsetAsync(static_cast<std::int32_t*>(token_counts_.p) + slot * static_cast<std::size_t>(token_domain_),
@@ -2843,6 +2978,10 @@ private:
     // counts the reads toward `lane` (the round's first row).
     void read_behind_gate(Lane& lane, std::uint32_t word, const std::function<void()>& read) {
         device_.flush();
+        report_gated_read(read_and_release_gate(lane, word, read));
+    }
+
+    std::uint64_t read_and_release_gate(Lane& lane, std::uint32_t word, const std::function<void()>& read) {
         const NgramVolume::Counters before = volume_.counters();
         read();
         const NgramVolume::Counters& after = volume_.counters();
@@ -2850,8 +2989,13 @@ private:
         ++lane.gate.rounds;
         lane.gate.reads += after.reads - before.reads;
         lane.gate.read_ns += after.read_ns - before.read_ns;
-        if (after.read_ns - before.read_ns > kSlowGatedReadNs) {
-            diagnostic("n-gram rows behind the gate took " + std::to_string((after.read_ns - before.read_ns) / 1000000) +
+        return after.read_ns - before.read_ns;
+    }
+
+    // Observer callbacks stay on the execution thread, including worker reads.
+    void report_gated_read(std::uint64_t elapsed) {
+        if (elapsed > kSlowGatedReadNs) {
+            diagnostic("n-gram rows behind the gate took " + std::to_string(elapsed / 1000000) +
                            " ms (the GPU waited at layer 1)",
                        DiagnosticLevel::Warning);
         }
@@ -2869,10 +3013,16 @@ private:
         // The ring's copies queue on the copy engine behind the io upload above. A call the CPU can
         // share (design §19.3.12) gates the stream on each layer's routing.
         split_call_ = streamed && split_policy_ && batch * width <= split_columns();
-        if (streamed) { expert_stream_->begin(ring_span(), residency_->host_table(), s, split_call_); }
+        if (streamed) {
+            expert_stream_->begin(ring_span(), residency_->host_table(), s, split_call_);
+            if (parallel_) { parallel_->begin_prefill_stream(); }
+        }
         const WideWork wide(*this, batch * width);
         forward_call(batch, width, logit_columns, nullptr, chunk, vision, nullptr, streamed);
-        if (streamed) { expert_stream_->end(); }
+        if (streamed) {
+            expert_stream_->end();
+            if (parallel_) { parallel_->end_prefill_stream(); }
+        }
         split_call_ = false;
         residency_->enqueue_route_download(s, batch * width);
     }
@@ -2905,12 +3055,19 @@ private:
         if (!stream_lease_.valid()) {
             const std::int32_t* table = residency_->host_table();
             const std::uint32_t E     = c_.moe.experts;
-            std::uint32_t most        = 0;
+            std::uint32_t owned_experts = 0, owned_layers = 0, most = 0;
             for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) {
-                std::uint32_t absent = 0;
-                for (std::uint32_t e = 0; e < E; ++e) { absent += table[static_cast<std::size_t>(l) * E + e] < 0 ? 1U : 0U; }
+                std::uint32_t owned = 0, absent = 0;
+                for (std::uint32_t e = 0; e < E; ++e) {
+                    if (!residency_->owns(l, e)) { continue; }
+                    ++owned;
+                    absent += table[static_cast<std::size_t>(l) * E + e] < 0 ? 1U : 0U;
+                }
+                owned_experts = std::max(owned_experts, owned);
+                owned_layers += owned != 0;
                 most = std::max(most, absent);
             }
+            if (owned_layers == 0) { return false; }
             const std::uint64_t stride  = residency_->frame_stride();
             const auto frames_of        = [&](std::size_t bytes) {
                 return static_cast<std::uint32_t>((bytes + stride - 1) / stride);
@@ -2922,10 +3079,10 @@ private:
             const std::uint32_t lendable    = residency_->lendable();
             if (wide_frames >= lendable) { return false; }
             const std::uint32_t evicted = wide_frames + walk_frames;
-            const std::uint32_t widened = std::min(E, most + (evicted + c_.num_hidden_layers - 1) / c_.num_hidden_layers);
+            const std::uint32_t widened = std::min(owned_experts, most + (evicted + owned_layers - 1) / owned_layers);
             const bool walk = walk_frames > 0 && 2 * widened + 1 + wide_frames + walk_frames <= lendable;
-            const std::uint32_t half = walk ? widened : std::min(E, most + (wide_frames + c_.num_hidden_layers - 1) /
-                                                                              c_.num_hidden_layers);
+            const std::uint32_t half = walk ? widened : std::min(owned_experts, most + (wide_frames + owned_layers - 1) /
+                                                                              owned_layers);
             const std::uint32_t ring = std::min(2 * half + 1, lendable - wide_frames);
             if (half == 0 || expert_stream_->slots_in(static_cast<std::size_t>(ring) * stride) < 2 * kStreamHalfMin) {
                 return false;
@@ -2961,8 +3118,13 @@ private:
                 program.enter_wide();
                 active_ = true;
             }
+            if (program.parallel_) {
+                try { parallel_active_ = program.parallel_->enter_wide(columns); }
+                catch (...) { if (active_) { program.leave_wide(); } throw; }
+            }
         }
         ~WideWork() {
+            if (parallel_active_) { program_.parallel_->leave_wide(); }
             if (active_) { program_.leave_wide(); }
         }
         WideWork(const WideWork&)            = delete;
@@ -2971,6 +3133,7 @@ private:
     private:
         ProgramImpl& program_;
         bool active_ = false;
+        bool parallel_active_ = false;
     };
 
     void enter_wide() {
@@ -3008,6 +3171,7 @@ private:
     // After a prompt's last wide call is enqueued: the wide arena's own lease or allocation goes back
     // (the stream lease's part goes back with it).
     void return_wide_work() {
+        if (parallel_) { parallel_->return_wide_work(); }
         if (work_lease_.valid()) { residency_->give_back(work_lease_, device_.stream); }
         work_lease_ = {};
         if (wide_fallback_.p != nullptr) {
@@ -3075,6 +3239,7 @@ private:
     // Runs a fixed-address round: the first time eagerly (the Ops' one-time setup), the second
     // captured, then by replay.
     void replay(DecodeGraph& graph, const std::function<void()>& body) {
+        if (!options_.use_cuda_graph) { body(); return; }
         const cudaStream_t s = device_.stream;
         if (graph.executable.ready()) {
             graph.executable.launch(s);
@@ -3175,8 +3340,10 @@ private:
 
     // ---------------------------------------------------------------- speculative verification
     void allocate_verification(std::int32_t lanes, std::uint64_t& allocated) {
-        allocate(records_backing_, plan_.records_bytes, allocated);
-        records_ = GdnReplayRecords(DeviceSpan{records_backing_.p, records_backing_.bytes}, plan_.records);
+        if (!parallel_gdn_) {
+            allocate(records_backing_, plan_.records_bytes, allocated);
+            records_ = GdnReplayRecords(DeviceSpan{records_backing_.p, records_backing_.bytes}, plan_.records);
+        }
         allocate(ple_records_, plan_.ple_records, allocated);
         allocate(qsa_records_, plan_.qsa_records, allocated);
         folds_.resize(static_cast<std::size_t>(max_width_) + 1);
@@ -3195,7 +3362,8 @@ private:
 
     execution::ForwardVerify verify_view(std::int32_t batch, std::int32_t width) const {
         execution::ForwardVerify v;
-        v.gdn        = records_.narrowed(width);
+        if (parallel_gdn_) { v.gdn.spec = plan_.records.spec; v.gdn.spec.width = width; }
+        else { v.gdn = records_.narrowed(width); }
         v.ple_inputs = Tensor(ple_records_.p, DType::BF16, {width_, width, batch});
         v.qsa_keys   = Tensor(qsa_records_.p, DType::BF16, {di_, width, batch, dim(c_.attention_layers)});
         return v;
@@ -3260,6 +3428,10 @@ private:
         }
         upload_pinned(io_device_.p, io_host_.data(), io_layout_.ngram, s);
         upload_pinned(spec_device_.p, spec_host_.data(), 4ULL * spec_layout_.licensed, s);
+        PendingNgramRead reading;
+        if (gated && ngram_reader_) {
+            reading.future = start_ngram_read(lanes_[lanes[0]], word, io_prefix(batch * W) - io_layout_.ngram, read_rows);
+        }
         if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this round
         residency_->before_round(s, /*landing=*/true, /*walking=*/walk_.active);
         const execution::NgramRowGate gate = row_gate();
@@ -3269,7 +3441,7 @@ private:
         });
         // From here an enqueued gate waits for `word`: an error before it is published still
         // publishes it (over zeroed rows), so the stream drains and the error keeps its class.
-        GateRelease release_gate{gated ? this : nullptr, word, io_prefix(batch * W) - io_layout_.ngram};
+        GateRelease release_gate{gated && !reading.future.valid() ? this : nullptr, word, io_prefix(batch * W) - io_layout_.ngram};
         residency_->enqueue_route_download(s, batch * W);
 
         // Acceptance on the device, from BF16-rounded logits as in plain decode (design 16.5).
@@ -3303,7 +3475,8 @@ private:
         CUDA_CHECK(cudaMemcpyAsync(spec_host(spec_layout_.licensed), licensed.data,
                                    4ULL * (spec_layout_.commit - spec_layout_.licensed), cudaMemcpyDeviceToHost, s));
         if (gated) {
-            read_behind_gate(lanes_[lanes[0]], word, read_rows);
+            if (reading.future.valid()) { report_gated_read(reading.future.get()); }
+            else { read_behind_gate(lanes_[lanes[0]], word, read_rows); }
             release_gate.owner = nullptr;
         }
         device_.synchronize();
@@ -3414,7 +3587,9 @@ private:
             }
         }
         upload_pinned(spec_device(spec_layout_.commit), commit, 4ULL * batch, s);
-        fold(W).execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), static_cast<std::size_t>(batch)), s);
+        const auto committed = std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), static_cast<std::size_t>(batch));
+        if (parallel_gdn_) { parallel_->commit_gdn(*parallel_gdn_, W, committed); }
+        else { fold(W).execute(committed, s); }
         auto* io = static_cast<std::byte*>(io_device_.p);
         const Tensor commit_columns(spec_device(spec_layout_.commit), DType::I32, {batch});
         const Tensor slots(io + io_layout_.slots, DType::I32, {batch});
@@ -3792,6 +3967,7 @@ private:
     const TextConfig& c_;
     ProgramOptions options_;
     NgramVolume volume_;
+    std::unique_ptr<HostWorkerPool> ngram_reader_;
     NgramHash hash_;
     DeviceLayout plan_;
     std::unique_ptr<VramBudgetSource> vram_;
@@ -3892,6 +4068,8 @@ private:
     DeviceBuffer state_backing_, ple_backing_, tails_backing_, kv_backing_, staging_;
     // The vq2/k4v2 exact window (design §19.3.15), every KV layer and lane.
     DeviceBuffer window_backing_;
+    std::unique_ptr<VmmRange> window_vmm_;
+    void* window_base() const { return window_vmm_ ? window_vmm_->base() : window_backing_.p; }
     prefix::KvWindowGeometry window_geometry_;
 
     // ---- the host-to-device link (design §19.3.12: bandwidth-dependent choices follow the machine) ----
@@ -3991,11 +4169,24 @@ private:
     // Maps (and zeroes) the chunks pages [0, pages) need; false when the device has no memory.
     bool map_kv(std::uint32_t pages) {
         const auto need = kv_chunks(plan_, pages);
-        for (std::size_t c = 0; c < need.size(); ++c) {
-            if (!need[c] || kv_vmm_->mapped(c)) { continue; }
-            if (!kv_vmm_->map(c)) { return false; }
-            CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(kv_vmm_->base()) + c * kKvChunkBytes, 0, kKvChunkBytes,
-                                       device_.stream));
+        std::vector<std::size_t> mapped_now;
+        const auto rollback = [&] {
+            device_.synchronize();
+            for (const auto chunk : mapped_now) { kv_vmm_->unmap(chunk); }
+        };
+        try {
+            for (std::size_t c = 0; c < need.size(); ++c) {
+                if (!need[c] || kv_vmm_->mapped(c)) { continue; }
+                const bool mapped = plan_.kv_owners.empty() ? kv_vmm_->map(c) :
+                    kv_vmm_->map(c, options_.parallel_devices[plan_.kv_owners[c]], options_.parallel_devices);
+                if (!mapped) { rollback(); return false; }
+                mapped_now.push_back(c);
+                CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(kv_vmm_->base()) + c * plan_.kv_chunk_bytes,
+                                           0, plan_.kv_chunk_bytes, device_.stream));
+            }
+        } catch (...) {
+            rollback();
+            throw;
         }
         return true;
     }
@@ -4011,7 +4202,18 @@ private:
         target = std::min(pool_->capacity_pages(), (target + kKvGrowPages - 1) / kKvGrowPages * kKvGrowPages);
         if (target - backed < need - pool_->available_pages()) { return false; }
         const std::lock_guard<std::mutex> lock(vram_mutex_);
-        const std::size_t added    = kv_mapped_bytes(plan_, target) - kv_vmm_->mapped_bytes();
+        const auto planned = kv_mapped_bytes(plan_, target);
+        const auto current = kv_vmm_->mapped_bytes(device_.device);
+        const std::size_t added = planned > current ? planned - current : 0;
+        if (parallel_) {
+            std::vector<std::size_t> per_rank(options_.parallel_devices.size());
+            for (std::size_t rank = 1; rank < per_rank.size(); ++rank) {
+                const auto want = kv_mapped_bytes(plan_, target, rank);
+                const auto have = kv_vmm_->mapped_bytes(options_.parallel_devices[rank]);
+                per_rank[rank] = want > have ? want - have : 0;
+            }
+            if (!parallel_->reserve_peer_kv(per_rank)) { return false; }
+        }
         const std::uint64_t stride = residency_->frame_stride();
         const std::uint32_t frames = residency_->frames();
         // Memory the sizing function would give the frames anyway comes first; the rest is taken from
@@ -4065,14 +4267,24 @@ private:
         if (target == pool_->backed_pages()) { return; }
         const std::lock_guard<std::mutex> lock(vram_mutex_);
         device_.synchronize();
-        const std::size_t before = kv_vmm_->mapped_bytes();
+        const std::size_t before = kv_vmm_->mapped_bytes(device_.device);
+        std::vector<std::size_t> peer_before(options_.parallel_devices.size());
+        for (std::size_t i = 1; i < peer_before.size(); ++i) {
+            peer_before[i] = kv_vmm_->mapped_bytes(options_.parallel_devices[i]);
+        }
         pool_->set_backed_pages(target);
         const auto need = kv_chunks(plan_, target);
         for (std::size_t c = 0; c < need.size(); ++c) {
             if (!need[c] && kv_vmm_->mapped(c)) { kv_vmm_->unmap(c); }
         }
         kv_grown_.store(target > plan_.kv_base_pages);
-        const std::size_t freed   = before - kv_vmm_->mapped_bytes();
+        const std::size_t freed   = before - kv_vmm_->mapped_bytes(device_.device);
+        if (parallel_) {
+            for (std::size_t i = 1; i < peer_before.size(); ++i) {
+                peer_before[i] -= kv_vmm_->mapped_bytes(options_.parallel_devices[i]);
+            }
+            parallel_->return_peer_kv(peer_before);
+        }
         const std::uint64_t stride = residency_->frame_stride();
         const std::uint32_t frames = residency_->frames();
         (void)residency_->resize(frames + static_cast<std::uint32_t>(freed / stride), device_.stream, *vram_);
@@ -4161,17 +4373,25 @@ private:
     PinnedHostBuffer io_host_{1}, host_sampled_{1}, host_configs_{1};
     IoLayout io_layout_;
     std::unique_ptr<LinearAttentionStatePool> gdn_;
+    std::unique_ptr<execution::ParallelGdnState> parallel_gdn_;
     prefix::KvPageGeometry kv_geometry_;
     std::unique_ptr<DeviceKVPagePool> pool_;
     std::unique_ptr<KVExecutionTablePool> tables_;
     std::size_t work_capacity_ = 0;
     std::unique_ptr<WorkspaceArena> work_;
+    std::unique_ptr<WorkspaceArena> pipeline_work_;
+    cudaEvent_t pipeline_ready_ = nullptr, pipeline_done_ = nullptr;
+    bool pipeline_defer_finish_ = false;
+    std::size_t pipeline_group_end_ = SIZE_MAX;
+    void pipeline_switch() { parallel_->switch_pipeline_stage(); std::swap(*work_, *pipeline_work_); }
+    void walk_pipeline();
     // SSD tier mode (design §19.3.7): the fetch channel and the tier outlive everything that reads
     // their memory (the residency's promotion copies, the stream, the CPU service), declared later.
     std::unique_ptr<ops::offloaded_moe::FetchChannel> fetch_channel_;
     std::unique_ptr<HostExpertTier> tier_;
     PinnedHostBuffer expert_error_{1}; // mapped u32: ops::MoeExpertSource::error of every call
     bool clear_prefix_on_release_ = false;
+    std::unique_ptr<execution::ParallelExecution> parallel_; // outlives residency's borrowed peers
     std::unique_ptr<ExpertResidency> residency_;
     std::unique_ptr<execution::ExpertStream> expert_stream_;
     ExpertResidency::FrameLease stream_lease_;
@@ -4197,6 +4417,9 @@ private:
         std::vector<std::int32_t> begins, widths, offsets; // per chunk: position, width, residual column
         std::uint32_t next_layer      = 0;                // the next decoder layer to enqueue
         std::uint32_t layers_per_step = 1;
+        std::size_t pipeline_begin = 0, pipeline_calls = 0;
+        std::uint32_t pipeline_layer = 0;
+        bool pipeline_draining = false;
         std::size_t io_stride = 0, residual_bytes = 0;
         std::int32_t host_slot = 0; // the lane's state slot as the Forward reads it on the host
         std::vector<std::optional<execution::MtpChunk>> mtp;

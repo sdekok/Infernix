@@ -768,6 +768,16 @@ int main() {
                                7200U + static_cast<std::uint32_t>(T));
     }
 
+    // Whole GDN head shards: TP4, uneven TP3 and TP2. Preserve the original
+    // FP64 output and exact history criteria across both dispatch routes.
+    for (const int d : {512, 640, 768, 1024}) {
+        for (const int T : {1, 7, 16, 17, 32, 33, 65, 512}) {
+            for (const bool alias : {false, true}) {
+                failures += split_case(5 * d, d, d, 3 * d, T, alias, false, 8000U + d + T);
+            }
+        }
+    }
+
     // Argument rejection, on both sides of the route bound.
     failures += split_rejection_case(16);
     failures += split_rejection_case(128);

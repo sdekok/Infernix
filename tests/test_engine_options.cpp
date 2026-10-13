@@ -41,6 +41,27 @@ int main() {
         return 77;
     }
     int failures = 0;
+    for (const auto ids : {std::vector<int>{}, std::vector<int>{0,1}, std::vector<int>{0,1,2}}) {
+        infernix::EngineOptions pipeline;
+        pipeline.parallel_devices = ids; pipeline.pipeline_parallel = true;
+        bool invalid = false;
+        const auto error = construction_error(pipeline, invalid);
+        failures += check(invalid && error.find("requires four") != std::string::npos, "pipeline must reject non-four-GPU plans before loading");
+    }
+    for (const auto ids : {std::vector<int>{}, std::vector<int>{0,1}, std::vector<int>{0,1,2}}) {
+        infernix::EngineOptions fixed;
+        fixed.parallel_devices = ids; fixed.fixed_kv_owners = true;
+        bool invalid = false;
+        const auto error = construction_error(fixed, invalid);
+        failures += check(invalid && error.find("requires four") != std::string::npos, "fixed must reject non-four-GPU plans before loading");
+    }
+    {
+        infernix::EngineOptions mixed;
+        mixed.parallel_devices = {0,1,2,3}; mixed.pipeline_parallel = true; mixed.fixed_kv_owners = true;
+        bool invalid = false;
+        const auto error = construction_error(mixed, invalid);
+        failures += check(invalid && error.find("without --pipeline-parallel") != std::string::npos, "incompatible layouts accepted");
+    }
     infernix::EngineOptions options;
     // Both artifact extensions name the same container; any other is rejected before reading.
     for (const char* artifact : {"absent-artifact.infernix", "absent-artifact.ninfer"}) {

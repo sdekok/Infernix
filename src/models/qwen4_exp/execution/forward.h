@@ -24,6 +24,28 @@
 
 namespace infernix::models::qwen4_exp::execution {
 
+class ParallelExecution;
+class ParallelGdnState;
+
+// One QSA block's attention through `layer` and `tails`. Index keys go to `key_records` when
+// set (verification and MTP catch-up: tails unchanged) or advance the tails when update_tails;
+// kv_only stops after the K/V and index-key writes and returns an empty tensor.
+struct AttentionCall {
+    int layer_index = 0;
+    const ops::QsaKVLayer& layer;
+    Tensor& tails;
+    Tensor key_records;
+    bool update_tails = true;
+    bool kv_only      = false;
+    const Tensor& positions;
+    const Tensor& rope_positions;
+    const Tensor& block_start_rope;
+    const Tensor& slots;
+    const Tensor& table_rows;
+    std::int32_t batch = 0, width = 0;
+};
+
+
 // Columns of one MTP call inside a prefill chunk (bounds the drafter's share of the workspace);
 // the Program stages the chunk's RoPE positions per sub-chunk of this many cells.
 inline constexpr std::int32_t kMtpChunkColumns = 512;
@@ -31,6 +53,7 @@ inline constexpr std::int32_t kMtpChunkColumns = 512;
 // Program-owned recurrent state of every slot.
 struct ForwardState {
     LinearAttentionStatePool* gdn = nullptr; // one layer per GDN block
+    ParallelGdnState* parallel_gdn = nullptr;
     Tensor ple_conv;                         // BF16 [S*H, span, slots]
     std::vector<Tensor> qsa_tails;           // per attention block: BF16 [Di, R - 1, slots]
     Tensor mtp_tails;                        // the MTP block's tails (empty without MTP)
@@ -58,6 +81,7 @@ public:
 // Where each layer's routed experts live: device frames for resident experts, the pinned host
 // bank otherwise.
 struct ForwardExperts {
+    ParallelExecution* parallel = nullptr; // Program-owned; null on the single-GPU route
     const std::uint8_t* frame_base = nullptr;
     std::uint64_t frame_stride     = 0;
     std::vector<const std::int32_t*> frames; // per layer, device I32 [E]: frame or -1
@@ -254,25 +278,11 @@ public:
                                                          std::int32_t max_context, KvCacheStorage storage);
 
 private:
+    void shared_swiglu(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceArena& work, cudaStream_t stream);
+    void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceArena& work, cudaStream_t stream);
     void ple(const PleParameters& p, Tensor& residual, const ForwardBatch& batch);
     Tensor mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject);
     Tensor gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch);
-    // One QSA block's attention through `layer` and `tails`. Index keys go to `key_records` when
-    // set (verification and MTP catch-up: tails unchanged) or advance the tails when update_tails;
-    // kv_only stops after the K/V and index-key writes and returns an empty tensor.
-    struct AttentionCall {
-        const ops::QsaKVLayer& layer;
-        Tensor& tails;
-        Tensor key_records;
-        bool update_tails = true;
-        bool kv_only      = false;
-        const Tensor& positions;
-        const Tensor& rope_positions;
-        const Tensor& block_start_rope;
-        const Tensor& slots;
-        const Tensor& table_rows;
-        std::int32_t batch = 0, width = 0;
-    };
     Tensor attention(const AttentionParameters& p, const Tensor& x, const AttentionCall& call);
     Tensor moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
                const ForwardBatch* batch = nullptr);

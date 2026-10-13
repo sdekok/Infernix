@@ -78,6 +78,9 @@ struct BenchOptions {
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     int device            = 0;
+    std::vector<int> parallel_devices;
+    bool pipeline_parallel = false;
+    bool fixed_kv_owners = false;
     bool use_cuda_graph   = true;
     bool profile_measured = false;
     OutputFormat output   = OutputFormat::Table;
@@ -91,6 +94,7 @@ struct RepTiming {
     std::uint32_t generated_output_tokens = 0;
     std::optional<ConstraintObservation> constraint;
     double constraint_draft_wait_exposed_seconds = 0.0;
+    std::vector<std::int32_t> generated_token_ids;
 };
 
 struct TestResult {
@@ -110,6 +114,9 @@ struct Stats {
 };
 
 struct BenchEnvironment {
+    std::vector<int> parallel_devices;
+    bool pipeline_parallel = false;
+    bool fixed_kv_owners = false;
     std::string gpu_name;
     std::string cuda_runtime_version;
     std::string cuda_driver_version;

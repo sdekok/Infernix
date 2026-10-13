@@ -1,6 +1,9 @@
 #include "models/qwen4_exp/program/prefix/state_image.h"
 
 #include "core/device.h"
+#include "core/peer_copy.h"
+#include "models/qwen4_exp/execution/parallel_state.h"
+#include "models/qwen4_exp/parallel_kv.h"
 
 #include <algorithm>
 #include <cstring>
@@ -54,12 +57,13 @@ void for_each_segment_run(std::size_t offset, std::size_t bytes, std::size_t seg
 
 } // namespace
 
-KvWindowGeometry kv_window_geometry(const TextConfig& c, KvCacheStorage storage, bool mtp, std::uint32_t lanes) {
+KvWindowGeometry kv_window_geometry(const TextConfig& c, KvCacheStorage storage, bool mtp, std::uint32_t lanes, bool parallel) {
     KvWindowGeometry g;
     if (!kv_storage_has_exact_window(storage)) { return g; }
     g.kv_heads  = static_cast<std::int32_t>(c.attention.kv_heads);
     g.kv_layers = c.attention_layers + (mtp ? 1U : 0U);
     g.lanes     = lanes;
+    g.head_major = parallel;
     return g;
 }
 
@@ -76,14 +80,19 @@ std::size_t KvWindowGeometry::lane_bytes(int plane) const {
 
 std::size_t KvWindowGeometry::layer_bytes() const {
     std::size_t bytes = 0;
-    for (int p = 0; p < kPlanes; ++p) { bytes += lane_bytes(p) * lanes; }
+    for (int p = 0; p < kPlanes; ++p) { bytes += head_major ? head_stride(p) * kv_heads : lane_bytes(p) * lanes; }
     return bytes;
 }
 
 std::size_t KvWindowGeometry::plane_offset(std::uint32_t kv_layer, int plane) const {
     std::size_t offset = layer_bytes() * kv_layer;
-    for (int p = 0; p < plane; ++p) { offset += lane_bytes(p) * lanes; }
+    for (int p = 0; p < plane; ++p) { offset += head_major ? head_stride(p) * kv_heads : lane_bytes(p) * lanes; }
     return offset;
+}
+
+std::size_t KvWindowGeometry::head_stride(int plane) const {
+    const auto bytes = lane_bytes(plane) / kv_heads * lanes;
+    return head_major ? (bytes + kParallelStateChunk - 1) / kParallelStateChunk * kParallelStateChunk : lane_bytes(plane) / kv_heads;
 }
 
 PagedKVWindowView kv_window_view(const KvWindowGeometry& g, void* base, std::uint32_t kv_layer) {
@@ -92,12 +101,20 @@ PagedKVWindowView kv_window_view(const KvWindowGeometry& g, void* base, std::uin
     auto* bytes            = static_cast<std::byte*>(base);
     const std::int32_t s   = kKVWindowSlots, h = g.kv_heads, l = static_cast<std::int32_t>(g.lanes);
     const auto plane       = [&](int p) { return bytes + g.plane_offset(kv_layer, p); };
-    return PagedKVWindowView{.k_codes  = Tensor(plane(0), DType::I8, {kD256KVCacheHeadDim, s, h, l}),
+    auto out = PagedKVWindowView{.k_codes  = Tensor(plane(0), DType::I8, {kD256KVCacheHeadDim, s, h, l}),
                              .v_codes  = Tensor(plane(1), DType::I8, {kD256KVCacheHeadDim, s, h, l}),
                              .k_scales = Tensor(plane(2), DType::FP16, {kKVWindowGroups, s, h, l}),
                              .v_scales = Tensor(plane(3), DType::FP16, {kKVWindowGroups, s, h, l}),
                              .tags     = Tensor(plane(4), DType::I32, {2, s, h, l}),
                              .slots    = {}};
+    if (g.head_major) {
+        Tensor* planes[] = {&out.k_codes, &out.v_codes, &out.k_scales, &out.v_scales, &out.tags};
+        for (int p = 0; p < 5; ++p) {
+            planes[p]->nb[3] = g.lane_bytes(p) / h;
+            planes[p]->nb[2] = g.head_stride(p);
+        }
+    }
+    return out;
 }
 
 StateImageSpec state_image_spec(const TextConfig& c, bool mtp, KvCacheStorage storage) {
@@ -224,7 +241,22 @@ LaneStateImage::LaneStateImage(const StateImageLayout& layout, const LaneStateBu
         for (int p = 0; same && p < KvWindowGeometry::kPlanes; ++p) { same = w.lane_bytes(p) == spec.window_bytes[p]; }
         if (!same) { throw std::invalid_argument("Qwen4Exp state image: the exact window does not match the layout"); }
     }
-    if (gdn_layers > 0) {
+    if (gdn_layers > 0 && !buffers.gdn_shards.empty()) {
+        for (int layer = 0; layer < gdn_layers; ++layer) {
+        std::size_t recurrence = 0, conv = 0;
+        for (const auto& shard : buffers.gdn_shards) {
+            if (!shard.owns(layer)) { continue; }
+            if (!shard.state || shard.state->slot_count() < int(buffers.lanes)) {
+                throw std::invalid_argument("parallel lane image state geometry mismatch");
+            }
+            recurrence += shard.state->recurrent_slot(0, 0).bytes();
+            conv += shard.state->conv_slot(0, 0).bytes();
+        }
+        if (recurrence != spec.gdn_recurrent_bytes || conv != spec.gdn_conv_bytes) {
+            throw std::invalid_argument("parallel lane image does not cover all GDN state");
+        }
+        }
+    } else if (gdn_layers > 0) {
         if (buffers.gdn == nullptr || buffers.gdn->layer_count() != gdn_layers ||
             buffers.gdn->slot_count() < static_cast<std::int32_t>(buffers.lanes) ||
             buffers.gdn->recurrent_slot(0, 0).bytes() != spec.gdn_recurrent_bytes ||
@@ -234,8 +266,51 @@ LaneStateImage::LaneStateImage(const StateImageLayout& layout, const LaneStateBu
     }
 }
 
+std::vector<LaneStateImage::DeviceRun> LaneStateImage::device_runs(const StateImagePart& part, std::uint32_t lane) const {
+    check_lane(lane);
+    std::vector<DeviceRun> runs;
+    if (!buffers_.gdn_shards.empty() &&
+        (part.kind == StateImagePart::Kind::GdnRecurrent || part.kind == StateImagePart::Kind::GdnConv)) {
+        int keys = 0, values = 0;
+        for (const auto& shard : buffers_.gdn_shards) { if (shard.owns(part.index)) { keys += shard.heads.keys.count; values += shard.heads.values.count; } }
+        const auto& spec = buffers_.gdn_shards.front().state->spec();
+        const std::size_t DK = spec.key_head_dim, DV = spec.value_head_dim, KW = keys * DK, VW = values * DV;
+        for (const auto& shard : buffers_.gdn_shards) {
+            if (!shard.owns(part.index)) { continue; }
+            if (part.kind == StateImagePart::Kind::GdnRecurrent) {
+                const auto state = shard.state->recurrent_slot(part.index - shard.first_layer, lane);
+                runs.push_back({static_cast<std::byte*>(state.data), shard.heads.values.begin * DK * DV * 4, state.bytes()});
+            } else {
+                const auto state = shard.state->conv_slot(part.index - shard.first_layer, lane);
+                const std::size_t kw = shard.heads.keys.count * DK, vw = shard.heads.values.count * DV;
+                for (int t = 0; t < spec.conv_width; ++t) {
+                    auto* src = static_cast<std::byte*>(state.data) + t * (2 * kw + vw) * 2;
+                    const auto row = t * (2 * KW + VW);
+                    runs.push_back({src, (row + shard.heads.keys.begin * DK) * 2, kw * 2});
+                    runs.push_back({src + kw * 2, (row + KW + shard.heads.keys.begin * DK) * 2, kw * 2});
+                    runs.push_back({src + kw * 4, (row + 2 * KW + shard.heads.values.begin * DV) * 2, vw * 2});
+                }
+            }
+        }
+    } else if (part.kind == StateImagePart::Kind::QsaWindow && buffers_.window_geometry.head_major) {
+        const auto& w = buffers_.window_geometry;
+        const int plane = part.index % 5;
+        const auto bytes = w.lane_bytes(plane) / w.kv_heads;
+        for (int head = 0; head < w.kv_heads; ++head) {
+            runs.push_back({buffers_.window + w.plane_offset(part.index / 5, plane) + head * w.head_stride(plane) + lane * bytes,
+                           head * bytes, bytes});
+        }
+    } else { runs.push_back({device_part(part, lane), 0, part.bytes}); }
+    return runs;
+}
+
 std::byte* LaneStateImage::device_part(const StateImagePart& part, std::uint32_t lane) const {
     check_lane(lane);
+    if ((!buffers_.gdn_shards.empty() && (part.kind == StateImagePart::Kind::GdnRecurrent ||
+                                         part.kind == StateImagePart::Kind::GdnConv)) ||
+        (buffers_.window_geometry.head_major && part.kind == StateImagePart::Kind::QsaWindow)) {
+        throw std::logic_error("distributed state parts require the segmented copy operations");
+    }
     const StateImageSpec& spec = layout_->spec;
     std::uint32_t attention_layers = 0;
     for (const MixerKind kind : spec.layer_types) { attention_layers += kind == MixerKind::Attention ? 1U : 0U; }
@@ -276,12 +351,14 @@ void LaneStateImage::copy_lane_to_host(std::uint32_t lane, const HostImage& imag
     check_image(image.segments.size(), image.segment_bytes);
     for (std::size_t p = 1; p < layout_->parts.size(); ++p) {
         const StateImagePart& part = layout_->parts[p];
-        const std::byte* source    = device_part(part, lane);
-        for_each_segment_run(part.offset, part.bytes, image.segment_bytes,
+        for (const auto piece : device_runs(part, lane)) {
+            const std::byte* source = piece.data;
+            for_each_segment_run(part.offset + piece.offset, piece.bytes, image.segment_bytes,
                              [&](std::size_t segment, std::size_t within, std::size_t done, std::size_t run) {
                                  CUDA_CHECK(cudaMemcpyAsync(image.segments[segment] + within, source + done, run,
                                                             cudaMemcpyDeviceToHost, stream));
                              });
+        }
     }
 }
 
@@ -291,20 +368,26 @@ void LaneStateImage::copy_group_to_host(std::uint32_t group, std::uint32_t lane,
     if (group >= layout_->groups()) { throw std::out_of_range("Qwen4Exp state image: group out of range"); }
     for (std::uint32_t p = layout_->group_begin[group]; p < layout_->group_begin[group + 1U]; ++p) {
         const StateImagePart& part = layout_->parts[p];
-        const std::byte* source    = device_part(part, lane);
-        for_each_segment_run(part.offset, part.bytes, image.segment_bytes,
+        for (const auto piece : device_runs(part, lane)) {
+            const std::byte* source = piece.data;
+            for_each_segment_run(part.offset + piece.offset, piece.bytes, image.segment_bytes,
                              [&](std::size_t segment, std::size_t within, std::size_t done, std::size_t run) {
                                  CUDA_CHECK(cudaMemcpyAsync(image.segments[segment] + within, source + done, run,
                                                             cudaMemcpyDeviceToHost, stream));
                              });
+        }
     }
 }
 
 void LaneStateImage::copy_lane_to_packed(std::uint32_t lane, std::byte* packed, cudaStream_t stream) const {
     for (std::size_t p = 1; p < layout_->parts.size(); ++p) {
         const StateImagePart& part = layout_->parts[p];
-        CUDA_CHECK(cudaMemcpyAsync(packed + part.offset, device_part(part, lane), part.bytes,
-                                   cudaMemcpyDeviceToDevice, stream));
+        for (const auto piece : device_runs(part, lane)) {
+            if (buffers_.gdn_shards.empty() && !buffers_.window_geometry.head_major) {
+                CUDA_CHECK(cudaMemcpyAsync(packed + part.offset + piece.offset, piece.data, piece.bytes,
+                                           cudaMemcpyDeviceToDevice, stream));
+            } else { copy_peer_bytes(packed + part.offset + piece.offset, piece.data, piece.bytes, stream); }
+        }
     }
 }
 
@@ -323,12 +406,14 @@ void LaneStateImage::copy_group_from_host(std::uint32_t group, const HostImageCo
     if (group >= layout_->groups()) { throw std::out_of_range("Qwen4Exp state image: group out of range"); }
     for (std::uint32_t p = layout_->group_begin[group]; p < layout_->group_begin[group + 1U]; ++p) {
         const StateImagePart& part = layout_->parts[p];
-        std::byte* destination     = device_part(part, lane);
-        for_each_segment_run(part.offset, part.bytes, image.segment_bytes,
+        for (const auto piece : device_runs(part, lane)) {
+            std::byte* destination = piece.data;
+            for_each_segment_run(part.offset + piece.offset, piece.bytes, image.segment_bytes,
                              [&](std::size_t segment, std::size_t within, std::size_t done, std::size_t run) {
                                  CUDA_CHECK(cudaMemcpyAsync(destination + done, image.segments[segment] + within, run,
                                                             cudaMemcpyHostToDevice, stream));
                              });
+        }
     }
 }
 
@@ -337,12 +422,16 @@ void LaneStateImage::copy_group_from_packed(std::uint32_t group, const std::byte
     if (group >= layout_->groups()) { throw std::out_of_range("Qwen4Exp state image: group out of range"); }
     for (std::uint32_t p = layout_->group_begin[group]; p < layout_->group_begin[group + 1U]; ++p) {
         const StateImagePart& part = layout_->parts[p];
-        CUDA_CHECK(cudaMemcpyAsync(device_part(part, lane), packed + part.offset, part.bytes,
-                                   cudaMemcpyDeviceToDevice, stream));
+        for (const auto piece : device_runs(part, lane)) {
+            if (buffers_.gdn_shards.empty() && !buffers_.window_geometry.head_major) {
+                CUDA_CHECK(cudaMemcpyAsync(piece.data, packed + part.offset + piece.offset, piece.bytes,
+                                           cudaMemcpyDeviceToDevice, stream));
+            } else { copy_peer_bytes(piece.data, packed + part.offset + piece.offset, piece.bytes, stream); }
+        }
     }
 }
 
-KvPageGeometry kv_page_geometry(const TextConfig& c, KvCacheStorage storage, bool mtp) {
+KvPageGeometry kv_page_geometry(const TextConfig& c, KvCacheStorage storage, bool mtp, bool parallel) {
     const auto layout   = paged_kv_storage_layout(storage, static_cast<std::int32_t>(c.attention.head_dim));
     const auto kv_heads = static_cast<std::int32_t>(c.attention.kv_heads);
     KvPageGeometry out;
@@ -360,6 +449,12 @@ KvPageGeometry kv_page_geometry(const TextConfig& c, KvCacheStorage storage, boo
             {DType::BF16, static_cast<std::int32_t>(c.qsa.index_head_dim / c.qsa.compress_ratio), 1});
     }
     out.planes_per_layer = out.kv_layers == 0 ? 0U : static_cast<std::uint32_t>(out.geometry.planes.size()) / out.kv_layers;
+    if (parallel) {
+        out.geometry.device_plane_order = PagedKVPlaneOrder::HeadMajor;
+        for (auto& plane : out.geometry.planes) {
+            plane.alignment = plane.head_alignment = kParallelStateChunk;
+        }
+    }
     return out;
 }
 

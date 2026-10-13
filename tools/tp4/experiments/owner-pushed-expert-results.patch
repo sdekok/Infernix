@@ -1,0 +1,62 @@
+--- a/src/models/qwen4_exp/execution/parallel.cpp
++++ b/src/models/qwen4_exp/execution/parallel.cpp
+@@ -650,7 +650,7 @@
+ }
+ 
+ void ParallelExecution::begin_experts(std::uint32_t layer, const Tensor& x, const ops::MoeRouting& routing,
+-                                     bool streamed, bool release_stream) {
++                                     bool streamed, bool release_stream, Tensor& combined) {
+     auto& p = *impl_; RestoreDevice restore{p.primary.device};
+     const auto& c = p.parameters.model.config().text;
+     const int T = x.ne[1], K = c.moe.top_k, E = c.moe.experts;
+@@ -681,6 +681,10 @@
+         const int owned = (E + size() - 1 - i) / size();
+         ops::moe_experts(local_x, dispatch, source, K, std::min(owned, K * T), r.expert_work.p, output, s);
+         if (prefetched && release_stream) { r.prefill_stream->after_experts(layer, s); }
++        // Wide calls return disjoint slots from the producing GPUs in parallel.
++        // The primary's own expert work overlaps these writes; combine still
++        // reads every top-k slot in the original order after all owners join.
++        if (T >= 256) { gather_peer_experts(output, local.ids, combined, i, size(), s); }
+         CUDA_CHECK(cudaEventRecord(r.experts_done, s));
+     }
+ }
+@@ -688,6 +692,7 @@
+     auto& p = *impl_; p.primary.bind_to_current_thread();
+     for (int i = 1; i < size(); ++i) {
+         auto& r = *p.ranks[i]; CUDA_CHECK(cudaStreamWaitEvent(p.primary.stream, r.experts_done, 0));
++        if (routing.ids.ne[1] >= 256) { continue; }
+         Tensor peer(r.expert_outputs.p, DType::BF16, {output.ne[0], output.ne[1]});
+         gather_peer_experts(peer, routing.ids, output, i, size(), p.primary.stream);
+     }
+--- a/src/models/qwen4_exp/execution/forward.cpp
++++ b/src/models/qwen4_exp/execution/forward.cpp
+@@ -586,8 +586,9 @@
+     ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E, K * T);
+     const int owners = experts_.parallel ? experts_.parallel->size() : 1;
+     ops::moe_dispatch(routing, E, dispatch, route_log, s, 0, owners);
++    Tensor outputs = work_.alloc(DType::BF16, {H, K * T});
+     if (experts_.parallel) {
+-        experts_.parallel->begin_experts(layer, x, routing, batch && batch->stream, batch && batch->release_stream);
++        experts_.parallel->begin_experts(layer, x, routing, batch && batch->stream, batch && batch->release_stream, outputs);
+     }
+     ops::MoeExpertSource source{.frame_base   = experts_.frame_base,
+                                 .frames       = experts_.frames.at(layer),
+@@ -679,7 +680,6 @@
+     if (experts_.frame_stride != 0 && experts_.frame_stride != source.record_stride) {
+         throw std::invalid_argument("Qwen4Exp MoE: frame stride differs from the bank record stride");
+     }
+-    Tensor outputs = work_.alloc(DType::BF16, {H, K * T});
+     const std::int32_t max_jobs = std::min(E, K * T);
+     const DeviceSpan expert_ws  = work_.alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T, T, source.activation));
+     // The shared expert runs while the host computes the CPU-served misses.
+--- a/src/models/qwen4_exp/execution/parallel.h
++++ b/src/models/qwen4_exp/execution/parallel.h
+@@ -40,7 +40,7 @@
+     void resident_experts(const Tensor& x, const ops::MoeRouting& routing, const MtpParameters& parameters,
+                           Tensor& output);
+     void begin_experts(std::uint32_t layer, const Tensor& x, const ops::MoeRouting& routing,
+-                       bool streamed, bool release_stream);
++                       bool streamed, bool release_stream, Tensor& combined);
+     void finish_experts(const ops::MoeRouting& routing, Tensor& output);
+     Tensor attention(const AttentionParameters& parameters, const Tensor& x,
+                      const AttentionCall& call, const Tensor& block_tables,

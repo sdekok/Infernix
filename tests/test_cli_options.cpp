@@ -32,6 +32,12 @@ int check(bool condition, const char* message) {
 
 int run_tests() {
     int failures      = 0;
+    failures += check(!parse({"infernix", "model.infernix", "--prompt", "hello"}).pipeline_parallel, "pipeline must be opt-in");
+    failures += check(!parse({"infernix", "model.infernix", "--prompt", "hello"}).fixed_kv_owners, "fixed must be opt-in");
+    const auto pipeline = parse({"infernix", "model.infernix", "--prompt", "hello", "--parallel-devices", "0,1,2,3", "--pipeline-parallel"});
+    const auto fixed = parse({"infernix", "model.infernix", "--prompt", "hello", "--parallel-devices", "0,1,2,3", "--fixed-kv-owners"});
+    failures += check(pipeline.pipeline_parallel && pipeline.parallel_devices == std::vector<int>{0,1,2,3}, "pipeline selection lost");
+    failures += check(fixed.fixed_kv_owners && fixed.parallel_devices == std::vector<int>{0,1,2,3}, "fixed selection lost");
     const auto choice = parse({"infernix", "model.ninfer", "--prompt", "hello", "--choice", "",
                                "--choice", "a|b", "--choice", "你好"});
     failures += check(choice.choices == std::vector<std::string>{"", "a|b", "你好"},

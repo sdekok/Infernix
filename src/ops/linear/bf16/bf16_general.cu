@@ -2,6 +2,7 @@
 #include "core/device.h"
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/bf16/bf16_skinny.cuh"
+#include "ops/linear/bf16/bf16_launch.cuh"
 
 #include <cstddef>
 #include <cstdint>
@@ -43,6 +44,15 @@ void bf16_general_gemm(const Tensor& x, const Weight& weight, Tensor& out, cudaS
     const std::int32_t N = weight.n;
     const std::int32_t K = weight.k;
     const std::int32_t T = x.ne[1];
+    // Partitioned dense matrices often miss the full-matrix shape catalog.
+    // Use the same BF16 tensor-core math with row/K predicates for compact
+    // shards; retain scalar handling for physically unaligned matrices.
+    if (K % 8 == 0 && reinterpret_cast<std::uintptr_t>(weight.qdata) % 16 == 0) {
+        using Tile = Bf16KTailSchedule<Bf16RowTailSchedule<Bf16A16MmaSchedule<64, 128, 64, 32, 32, 2,
+            1, Cache::cg, Cache::cg, Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast>>>;
+        launch_bf16_mma<Tile>(x, weight, out, stream);
+        return;
+    }
     const dim3 grid(static_cast<unsigned>((N + kTileN - 1) / kTileN),
                     static_cast<unsigned>((T + kTileT - 1) / kTileT));
     bf16_general_gemm_kernel<<<grid, kThreads, 0, stream>>>(

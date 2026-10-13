@@ -180,7 +180,8 @@ void kv_cache_append_launch(const Tensor& k, const Tensor& v, const Tensor& posi
         launch_full<KVCacheAppendD256Kv4>(k, v, positions, cache, metadata, stream);
         return;
     }
-    launch_full<KVCacheAppendD256Kv2>(k, v, positions, cache, metadata, stream);
+    if (k.ne[1] == 1) { launch_full<KVCacheAppendD256Kv1>(k, v, positions, cache, metadata, stream); }
+    else { launch_full<KVCacheAppendD256Kv2>(k, v, positions, cache, metadata, stream); }
 }
 
 void kv_cache_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -219,8 +220,10 @@ void kv_cache_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor
             };
             if (k.ne[1] == KVCacheAppendD256Kv4::KVHeads)
                 append.template operator()<KVCacheAppendD256Kv4>();
-            else
+            else if (k.ne[1] == 2)
                 append.template operator()<KVCacheAppendD256Kv2>();
+            else
+                append.template operator()<KVCacheAppendD256Kv1>();
             CUDA_CHECK(cudaGetLastError());
             return;
         }
@@ -239,8 +242,10 @@ void kv_cache_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor
             };
             if (k.ne[1] == KVCacheAppendD256Kv4::KVHeads)
                 append.template operator()<KVCacheAppendD256Kv4>();
-            else
+            else if (k.ne[1] == 2)
                 append.template operator()<KVCacheAppendD256Kv2>();
+            else
+                append.template operator()<KVCacheAppendD256Kv1>();
             CUDA_CHECK(cudaGetLastError());
             return;
         }
@@ -248,7 +253,8 @@ void kv_cache_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor
             launch_full<KVCacheAppendD256Kv4>(k, v, positions, cache, metadata, stream);
             return;
         }
-        launch_full<KVCacheAppendD256Kv2>(k, v, positions, cache, metadata, stream);
+        if (k.ne[1] == 1) { launch_full<KVCacheAppendD256Kv1>(k, v, positions, cache, metadata, stream); }
+        else { launch_full<KVCacheAppendD256Kv2>(k, v, positions, cache, metadata, stream); }
     };
     if (valid_columns.data == nullptr) {
         launch.template operator()<false>();

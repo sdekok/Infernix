@@ -104,7 +104,9 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     const std::int32_t value_heads = v.ne[1];
     const std::int32_t width       = q.ne[2];
     const std::int32_t rows        = q.ne[3];
-    const bool registered_heads    = qk_heads == 16 && (value_heads == 48 || value_heads == 32);
+    const bool shard = (qk_heads == 4 || qk_heads == 5 || qk_heads == 6 || qk_heads == 8) &&
+                       value_heads == 3 * qk_heads;
+    const bool registered_heads = (qk_heads == 16 && (value_heads == 48 || value_heads == 32)) || shard;
     if (!registered_heads || width < 2 || width > 64 || rows <= 0 || rows > kMaximumRows) {
         throw std::invalid_argument(std::string(kOp) + ": unsupported geometry");
     }
@@ -158,7 +160,12 @@ bool is_registered_fold_geometry(const GdnReplayRecordSpec& spec) {
                              spec.conv_channels == 8192;
     const bool geometry_36 = spec.layers == 36 && spec.qk_heads == 16 && spec.value_heads == 48 &&
                              spec.conv_channels == 10240;
-    return geometry_48 || geometry_30 || geometry_36;
+    const bool shard_36 = spec.layers == 36 &&
+        (spec.qk_heads == 4 || spec.qk_heads == 5 || spec.qk_heads == 6 || spec.qk_heads == 8) &&
+        spec.value_heads == 3 * spec.qk_heads && spec.conv_channels == 640 * spec.qk_heads;
+    const bool pipeline_shard = spec.layers == 18 && spec.qk_heads == 8 &&
+        spec.value_heads == 24 && spec.conv_channels == 5120;
+    return geometry_48 || geometry_30 || geometry_36 || shard_36 || pipeline_shard;
 }
 
 void validate_fold_records(const GdnReplayRecords& records) {

@@ -4,9 +4,11 @@
 #include "artifact/reader.h"
 #include "artifact/views.h"
 #include "models/qwen3_5/load/vision_overlay.h"
+#include "models/qwen4_exp/head_partition.h"
 #include "models/registry.h"
 
 #include <cmath>
+#include <chrono>
 #include <cstring>
 #include <map>
 #include <utility>
@@ -33,18 +35,21 @@ ops::LinearPolicy linear_policy(artifact::ActivationPolicy policy) {
 struct PendingWeight {
     artifact::ParameterReference reference;
     ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
+    bool parallel = false;
 };
 
 // Logical demands of the selected model; each parameter is declared exactly once.
 class Bindings {
 public:
-    explicit Bindings(artifact::Binder& binder) : binder_(binder) {}
+    explicit Bindings(artifact::Binder& binder, bool parallel) : binder_(binder), parallel_(parallel) {}
 
     WeightId parameter(std::string name, Shape shape, std::string_view input = {},
                        std::optional<QType> exact_format = {},
                        Residency residency                = Residency::Device) {
         if (ids_.contains(name)) { throw ArtifactError(name + ": duplicate parameter declaration"); }
         PendingWeight pending;
+        pending.parallel = parallel_ && residency == Residency::Device && shape.size() == 2 && !input.empty();
+        if (pending.parallel) { residency = Residency::Streamed; }
         pending.reference = binder_.parameter(name, std::move(shape), residency, exact_format);
         if (!input.empty()) {
             const auto& use = binder_.use(name, input);
@@ -70,6 +75,7 @@ public:
 
 private:
     artifact::Binder& binder_;
+    bool parallel_;
     std::map<std::string, WeightId, std::less<>> ids_;
 };
 
@@ -344,6 +350,8 @@ struct LoadPlan::Impl {
     FrontendResources resources;
     InstanceInfo info;
     std::optional<qwen3_5::VisionOverlayLayout> vision_overlay; // vision offload
+    std::vector<ParallelWeightPlan> parallel;
+    std::uint64_t primary_shard_bytes = 0;
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -369,7 +377,9 @@ std::uint64_t LoadPlan::pinned_other_bytes() const {
     return bytes;
 }
 
-std::uint64_t LoadPlan::device_bytes() const { return impl_->materialization.device_capacity_bytes; }
+std::uint64_t LoadPlan::device_bytes() const {
+    return impl_->materialization.device_capacity_bytes + impl_->primary_shard_bytes;
+}
 
 std::uint32_t LoadPlan::public_token_count() const {
     return static_cast<std::uint32_t>(impl_->resources.public_token_count);
@@ -407,9 +417,12 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     auto out     = std::make_unique<LoadPlan::Impl>();
     out->options = options;
     out->config  = parse_config(reader.directory(), options);
+    if (!options.parallel_devices.empty() && out->config.vision && !options.overlay_vision()) {
+        throw std::invalid_argument("parallel execution with vision requires vision offload (auto or on)");
+    }
     artifact::Binder binder(reader);
     out->resources = bind_resources(binder, out->config);
-    Bindings bindings(binder);
+    Bindings bindings(binder, !options.parallel_devices.empty());
     out->weights = bind_text(bindings, out->config.text,
                              options.stream_experts ? Residency::Streamed : Residency::HostPinned);
     if (out->config.vision) {
@@ -453,6 +466,124 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     }
     out->pending         = std::move(bindings.weights);
     out->materialization = std::move(binder).finish();
+    if (!options.parallel_devices.empty()) {
+        std::map<std::size_t, ParallelWeightPlan> partitions;
+        for (const auto& weight : out->pending) if (weight.parallel) {
+            if (weight.reference.binding.parts.size() != 1) {
+                throw ArtifactError("parallel weight must have one encoded parent: " + weight.reference.name);
+            }
+            const auto object = weight.reference.binding.parts.front().object;
+            partitions.try_emplace(object.index, ParallelWeightPlan{object});
+        }
+        const auto mark = [&](WeightId id, WeightPartition kind, int groups) {
+            const auto object = out->pending.at(id.index).reference.binding.parts.front().object;
+            auto& p = partitions.at(object.index); p.kind = kind; p.groups = groups;
+        };
+        const auto hc = [&](const HyperConnectionWeights& h) {
+            mark(h.up, WeightPartition::StreamFeatures, static_cast<int>(out->config.text.hc.streams));
+        };
+        hc(out->weights.final_mixer);
+        for (const auto& layer : out->weights.layers) {
+            hc(layer.attn_hc); hc(layer.mlp_hc);
+            mark(layer.moe.shared_gate, WeightPartition::Paired, 2);
+        }
+        if (out->weights.mtp) {
+            const auto& m = *out->weights.mtp;
+            hc(m.attn_hc); hc(m.mlp_hc); hc(m.final_mixer);
+            mark(m.shared_gate, WeightPartition::Paired, 2);
+            mark(m.expert_gate_up.front(), WeightPartition::Experts, static_cast<int>(out->config.text.moe.experts));
+            mark(m.expert_down.front(), WeightPartition::Experts, static_cast<int>(out->config.text.moe.experts));
+        }
+        const int ranks = static_cast<int>(options.parallel_devices.size());
+        if (options.pipeline_parallel && (ranks != 4 || out->config.text.num_hidden_layers != 48 || out->config.text.gdn_layers != 36 || out->config.text.attention_layers != 12)) {
+            throw ArtifactError("TP2+PP2 experiment requires four GPUs and the 48-block Flash-Next model");
+        }
+        if (options.pipeline_parallel &&
+            (std::count(out->config.text.layer_types.begin(), out->config.text.layer_types.begin() + 24, MixerKind::Attention) != 6 || out->config.text.moe.experts % 2 != 0)) {
+            throw ArtifactError("TP2+PP2 requires equal attention/GDN layer counts in both stages and an even expert count");
+        }
+        // Dense parents within a decoder block live only on that block's pair.
+        const auto pair_parent = [&](WeightId id, int stage) {
+            if (!id.valid()) { return; }
+            const auto object = out->pending.at(id.index).reference.binding.parts.front().object;
+            auto& p = partitions.at(object.index);
+            if (!p.rank_rows.empty()) { return; } // fused parents visited through multiple uses
+            p.rank_rows.resize(4);
+            const int rows = reader.geometry(object).shape[0];
+            for (int r = 0; r < 2; ++r) { p.rank_rows[stage * 2 + r] = parallel_weight_segments(rows, p.kind, p.groups, r, 2); }
+        };
+        const auto pair_hc = [&](const HyperConnectionWeights& h, int stage) { pair_parent(h.down, stage); pair_parent(h.up, stage); };
+        for (int l = 0; options.pipeline_parallel && l < 48; ++l) {
+            const auto& b = out->weights.layers[l]; const int stage = l / 24;
+            pair_hc(b.attn_hc, stage); pair_hc(b.mlp_hc, stage);
+            pair_parent(b.moe.router, stage); pair_parent(b.moe.shared_gate, stage); pair_parent(b.moe.shared_down, stage);
+            if (b.ple) { pair_parent(b.ple->key_projection, stage); }
+            if (const auto* a = std::get_if<AttentionWeights>(&b.mixer)) { pair_parent(a->output, stage); }
+            else { pair_parent(std::get<GdnWeights>(b.mixer).output, stage); }
+        }
+        const auto assign = [&](WeightId id, int owner, RowPartition rows) {
+            if (rows.count == 0) { return; }
+            const auto& ref = out->pending.at(id.index).reference;
+            const auto part = ref.binding.parts.front();
+            const auto k = reader.geometry(part.object).shape[1];
+            if (part.begin % k || part.end % k || rows.begin < 0 ||
+                std::uint64_t(rows.begin + rows.count) > (part.end - part.begin) / k) {
+                throw ArtifactError("semantic parallel binding does not cover complete rows: " + ref.name);
+            }
+            auto& plan = partitions.at(part.object.index);
+            plan.rank_rows.resize(ranks);
+            plan.rank_rows[owner].push_back({static_cast<int>(part.begin / k) + rows.begin, rows.count});
+        };
+        const auto& c = out->config.text;
+        const auto attention = [&](const AttentionWeights& a, int layer) {
+            const int heads = c.attention.kv_heads, d = c.attention.head_dim;
+            const int queries = c.attention.heads / heads;
+            for (int head = 0; head < heads; ++head) {
+                const int owner = attention_head_owner(layer, head, heads, ranks, options.pipeline_parallel, options.fixed_kv_owners);
+                assign(a.query, owner, {head * queries * d, queries * d});
+                assign(a.gate, owner, {head * queries * d, queries * d});
+                assign(a.key, owner, {head * d, d});
+                assign(a.value, owner, {head * d, d});
+            }
+            // The indexer is shared by both attention owners: one set of weights
+            // and pooled keys on the primary, preserving its global top-k choice.
+            assign(a.index_query, 0, {0, static_cast<int>(c.qsa.index_heads * c.qsa.index_head_dim)});
+            assign(a.index_key, 0, {0, static_cast<int>(c.qsa.index_head_dim)});
+        };
+        for (std::size_t layer = 0; layer < out->weights.layers.size(); ++layer) {
+            const auto& mixer = out->weights.layers[layer].mixer;
+            if (const auto* a = std::get_if<AttentionWeights>(&mixer)) {
+                attention(*a, c.compact_layer_indices[layer]);
+            } else {
+                const auto& g = std::get<GdnWeights>(mixer);
+                for (int owner = 0; owner < ranks; ++owner) {
+                    if (!pipeline_owns(layer, owner, c.num_hidden_layers, ranks, options.pipeline_parallel)) { continue; }
+                    const auto p = gdn_head_partition(c.gdn.key_heads, c.gdn.value_heads, owner, ranks, options.pipeline_parallel);
+                    const RowPartition k{p.keys.begin * int(c.gdn.key_head_dim), p.keys.count * int(c.gdn.key_head_dim)};
+                    const RowPartition v{p.values.begin * int(c.gdn.value_head_dim), p.values.count * int(c.gdn.value_head_dim)};
+                    assign(g.query, owner, k); assign(g.key, owner, k);
+                    assign(g.value, owner, v); assign(g.z, owner, v);
+                    assign(g.a_projection, owner, p.values); assign(g.b_projection, owner, p.values);
+                }
+            }
+        }
+        if (out->weights.mtp) { attention(out->weights.mtp->attention, c.attention_layers); }
+        for (auto& [index, p] : partitions) {
+            for (auto& rows : p.rank_rows) {
+                std::sort(rows.begin(), rows.end(), [](auto a, auto b) { return a.begin < b.begin; });
+            }
+        }
+        for (const auto& [index, p] : partitions) {
+            const auto& g = reader.geometry(p.object);
+            (void)parallel_weight_metadata(g, static_cast<int>(g.shape[0]));
+            const auto segments = parallel_weight_segments(static_cast<int>(g.shape[0]), p,
+                                                            0, static_cast<int>(options.parallel_devices.size()));
+            const auto row_bytes = g.layout == QuantLayout::Contiguous ? g.shape[1] * 2
+                                    : g.code_bytes_per_row + g.scale_bytes_per_row;
+            for (const auto segment : segments) { out->primary_shard_bytes += segment.count * row_bytes; }
+            out->parallel.push_back(p);
+        }
+    }
     if (out->weights.vision && options.overlay_vision()) {
         out->vision_overlay = vision_overlay_layout(*out->weights.vision, out->pending, out->materialization);
     }
@@ -468,7 +599,7 @@ Model::Model(Config config, LoadOptions options, TextWeights weights, std::vecto
              std::vector<ExpertBank> banks, FrontendResources resources, InstanceInfo info,
              std::optional<qwen3_5::VisionOverlayAssets> overlay_vision, artifact::MaterializedArtifact backing,
              std::optional<ExpertStore> expert_store)
-    : backing_(std::move(backing)), expert_store_(std::move(expert_store)), config_(std::move(config)), options_(options),
+    : backing_(std::move(backing)), storage_stats_(backing_.stats()), expert_store_(std::move(expert_store)), config_(std::move(config)), options_(options),
       weights_(std::move(weights)), bound_(std::move(bound)), banks_(std::move(banks)),
       resources_(std::move(resources)), info_(std::move(info)), overlay_vision_(std::move(overlay_vision)) {}
 
@@ -550,11 +681,28 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
                                                .ladder_bytes = 0,
                                                .layout       = std::move(*data->vision_overlay)};
     }
-    return std::unique_ptr<Model>(new Model(std::move(data->config), data->options,
+    auto model = std::unique_ptr<Model>(new Model(std::move(data->config), data->options,
                                             std::move(data->weights), std::move(bound),
                                             std::move(banks), std::move(data->resources),
                                             std::move(data->info), std::move(overlay), std::move(backing),
                                             std::move(store)));
+    if (!data->parallel.empty()) {
+        const auto start = std::chrono::steady_clock::now();
+        model->parallel_weights_ = std::make_unique<ParallelWeightStorage>(reader, model->backing_, data->parallel,
+                                                                          data->options.parallel_devices, device.device);
+        for (const auto gpu : data->options.parallel_devices) {
+            const auto bytes = model->parallel_weights_->bytes(gpu);
+            model->storage_stats_.device_capacity_bytes += bytes;
+            model->storage_stats_.read_bytes += bytes;
+            model->storage_stats_.h2d_bytes += bytes;
+            std::fprintf(stderr, "[parallel] GPU %d dense shards: %.2f GiB (no full primary copy)\n", gpu,
+                         double(bytes) / double(1ULL << 30));
+        }
+        model->storage_stats_.device_object_count += data->parallel.size();
+        model->storage_stats_.peak_staging_bytes = std::max<std::uint64_t>(model->storage_stats_.peak_staging_bytes, 8ULL << 20);
+        model->storage_stats_.upload_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    }
+    return model;
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,

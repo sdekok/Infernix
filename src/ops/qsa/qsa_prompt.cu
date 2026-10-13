@@ -1,6 +1,7 @@
 // QSA prompt attention on Tensor Cores (see qsa_prompt.h).
 
 #include "ops/qsa/qsa_prompt.h"
+#include "core/cuda_function_attributes.h"
 
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
@@ -888,9 +889,7 @@ void launch(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, con
     const auto run = [&]<int Stages>() {
         constexpr int bytes = prompt_smem_bytes<Storage, Stages>();
         static_assert(bytes <= 99 * 1024, "one CTA's shared memory on sm_120");
-        static const cudaError_t configured = cudaFuncSetAttribute(
-            qsa_prompt_kernel<Storage, Stages>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
-        require(configured == cudaSuccess, "cannot reserve the kernel's shared memory");
+        prepare_cuda_shared<qsa_prompt_kernel<Storage, Stages>>(bytes);
         const int columns = q.ne[2];
         const dim3 grid(static_cast<unsigned>(columns), static_cast<unsigned>(g.kv_heads));
         qsa_prompt_kernel<Storage, Stages><<<grid, PromptShape<Storage>::Warps * 32, bytes, stream>>>(

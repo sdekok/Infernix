@@ -86,7 +86,8 @@ bool is_dflash2_shape(const Q8LinearSwiGluProblem& problem) noexcept {
 }
 
 bool is_flash_next_shared_shape(const Q8LinearSwiGluProblem& problem) noexcept {
-    return problem.gate_up_rows == 1280 && problem.output_rows == 640 && problem.k == 2560 &&
+    return problem.gate_up_rows == 2 * problem.output_rows && problem.output_rows > 0 &&
+           problem.output_rows <= 640 && problem.output_rows % 16 == 0 && problem.k == 2560 &&
            problem.padded_k == 2560;
 }
 

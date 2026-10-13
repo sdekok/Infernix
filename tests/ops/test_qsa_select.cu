@@ -467,17 +467,19 @@ Selection run_reference(const Fixture& f, cudaStream_t stream) {
 struct ProductionBuffers {
     infernix::test::GuardedDeviceBuffer scratch, selected, counts;
     ProductionBuffers(const Fixture& f)
-        : scratch(infernix::ops::detail::qsa_select_scratch_bytes(f.g, f.columns, f.max_context)),
+        : scratch(infernix::ops::qsa_selection_workspace_bytes(f.g, f.columns, f.max_context)),
           selected(sizeof(std::int32_t) * static_cast<std::size_t>(f.columns) * f.top),
           counts(sizeof(std::int32_t) * static_cast<std::size_t>(f.columns)) {}
 };
 
 void launch_production(const Fixture& f, ProductionBuffers& buffers, cudaStream_t stream) {
-    infernix::ops::detail::qsa_select(f.index_q(), f.pooled(), f.batch_view(), f.g, f.max_context,
-                                    buffers.scratch.data(), buffers.scratch.bytes(),
-                                    {static_cast<std::int32_t*>(buffers.selected.data()),
-                                     static_cast<std::int32_t*>(buffers.counts.data())},
-                                    stream);
+    infernix::ops::QsaKVLayer layer;
+    layer.pooled_pages = f.pooled();
+    infernix::ops::QsaSelection selection{
+        Tensor(buffers.selected.data(), DType::I32, {f.top, f.columns}),
+        Tensor(buffers.counts.data(), DType::I32, {f.columns})};
+    infernix::ops::qsa_select_blocks(f.index_q(), layer, f.batch_view(), f.g, f.max_context,
+        buffers.scratch.data(), buffers.scratch.bytes(), selection, stream);
 }
 
 Selection read_production(const Fixture& f, ProductionBuffers& buffers, const std::string& tag) {

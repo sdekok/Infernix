@@ -1,0 +1,551 @@
+--- a/src/core/peer_copy.cu
++++ b/src/core/peer_copy.cu
+@@ -21,12 +21,12 @@
+ }
+ 
+ __global__ void experts_kernel(const std::uint16_t* input, const std::int32_t* ids,
+-                               std::uint16_t* output, int hidden, int entries, int rank, int ranks, int last = 0) {
++                               std::uint16_t* output, int hidden, int entries, int rank, int ranks, int last = 0, const std::int32_t* owners = nullptr) {
+     const std::int64_t count = std::int64_t(hidden) * entries;
+     for (std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+          i < count; i += std::int64_t(blockDim.x) * gridDim.x) {
+         const int expert = ids[i / hidden];
+-        if (ranks > 0 ? expert % ranks == rank : expert >= rank && expert < last) { output[i] = input[i]; }
++        if (ranks > 0 ? (owners ? owners[expert] : expert % ranks) == rank : expert >= rank && expert < last) { output[i] = input[i]; }
+     }
+ }
+ }
+@@ -59,7 +59,7 @@
+ }
+ 
+ void gather_peer_experts(const Tensor& peer, const Tensor& ids, Tensor& output,
+-                         int rank, int ranks, cudaStream_t stream) {
++                         int rank, int ranks, cudaStream_t stream, const std::int32_t* owners) {
+     if (peer.dtype != DType::BF16 || output.dtype != DType::BF16 || ids.dtype != DType::I32 ||
+         !peer.is_contiguous() || !output.is_contiguous() || !ids.is_contiguous() ||
+         peer.ne[0] != output.ne[0] || peer.ne[1] != output.ne[1] ||
+@@ -68,7 +68,7 @@
+     }
+     experts_kernel<<<copy_blocks(output.numel()), 256, 0, stream>>>(static_cast<const std::uint16_t*>(peer.data),
+         static_cast<const std::int32_t*>(ids.data), static_cast<std::uint16_t*>(output.data),
+-        output.ne[0], output.ne[1], rank, ranks);
++        output.ne[0], output.ne[1], rank, ranks, 0, owners);
+     CUDA_CHECK(cudaGetLastError());
+ }
+ void gather_peer_expert_range(const Tensor& peer, const Tensor& ids, Tensor& output,
+--- a/src/core/peer_copy.h
++++ b/src/core/peer_copy.h
+@@ -12,7 +12,7 @@
+ 
+ // Copies only this owner's routed output slots. Other slots are left untouched.
+ void gather_peer_experts(const Tensor& peer, const Tensor& ids, Tensor& output,
+-                         int rank, int ranks, cudaStream_t stream);
++                         int rank, int ranks, cudaStream_t stream, const std::int32_t* owners = nullptr);
+ void gather_peer_expert_range(const Tensor& peer, const Tensor& ids, Tensor& output,
+                              int first_expert, int count, cudaStream_t stream);
+ // Graph-safe, word-aligned P2P transfer performed by the destination device.
+--- a/src/models/qwen4_exp/execution/forward.cpp
++++ b/src/models/qwen4_exp/execution/forward.cpp
+@@ -578,7 +578,7 @@
+     const DeviceSpan dispatch_bytes = work_.alloc_bytes(ops::moe_dispatch_bytes(E, K * T));
+     ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E, K * T);
+     const int owners = experts_.parallel ? experts_.parallel->size() : 1;
+-    ops::moe_dispatch(routing, E, dispatch, route_log, s, 0, owners);
++    ops::moe_dispatch(routing, E, dispatch, route_log, s, 0, owners, experts_.parallel ? experts_.parallel->expert_owners(layer) : nullptr);
+     if (experts_.parallel) {
+         experts_.parallel->begin_experts(layer, x, routing, batch && batch->stream, batch && batch->release_stream);
+     }
+@@ -686,7 +686,7 @@
+     project(product, p.shared_down, shared, work_, s);
+     ops::moe_experts_cpu_wait(x, dispatch, source, max_jobs, expert_ws.data, outputs, s);
+     Tensor y = work_.alloc(DType::BF16, {H, T});
+-    if (experts_.parallel) { experts_.parallel->combine_experts(routing, outputs, shared, y); }
++    if (experts_.parallel) { experts_.parallel->combine_experts(layer, routing, outputs, shared, y); }
+     else { ops::moe_combine(outputs, routing, shared, y, s); }
+     return y;
+ }
+--- a/src/models/qwen4_exp/execution/parallel.cpp
++++ b/src/models/qwen4_exp/execution/parallel.cpp
+@@ -234,7 +234,7 @@
+             for (int reader : devices) { rank.cache->allow_peer_access(reader); }
+             rank.prefill_stream = std::make_unique<ExpertStream>(c.num_hidden_layers, c.moe.experts, stride,
+                 [this, i, stride](std::uint32_t layer, std::uint32_t expert) -> const std::uint8_t* {
+-                    if (expert % ranks.size() != i) { return nullptr; }
++                    if (parallel_expert_owner(layer, expert, parameters.model.config().text.moe.experts, parameters.model.config().text.num_hidden_layers, ranks.size()) != int(i)) { return nullptr; }
+                     const auto* bank = parameters.layers.at(layer).moe.bank;
+                     return reinterpret_cast<const std::uint8_t*>(bank->planes.device_records) + expert * stride;
+                 }, true);
+@@ -424,7 +424,7 @@
+     const auto& c = p.parameters.model.config().text;
+     // A full pair of owned layers guarantees every peer miss is streamed,
+     // including experts evicted by the loan itself. Tables occupy one frame.
+-    const auto frames = 2 * ((c.moe.experts + size() - 1) / size()) + 1;
++    const auto frames = 2 * std::max(parallel_expert_count(c.moe.experts, 0, size()), parallel_expert_count(c.moe.experts, size() - 1, size())) + 1;
+     for (int i = 1; i < size(); ++i) {
+         auto& r = *p.ranks[i]; r.device->bind_to_current_thread();
+         if (r.prefill_lease.valid()) { throw std::logic_error("parallel prefill stream already active"); }
+@@ -911,7 +911,7 @@
+         ops::MoeRouting local; local.ids = Tensor(r.expert_ids.p, DType::I32, {K, T});
+         local.weights = Tensor(weights, DType::FP32, {K, T});
+         auto dispatch = ops::carve_moe_dispatch(r.expert_dispatch.p, E, K * T);
+-        ops::moe_dispatch(local, E, dispatch, r.cache->route_log() + layer * r.cache->route_stride(), s, i, size());
++        ops::moe_dispatch(local, E, dispatch, r.cache->route_log() + layer * r.cache->route_stride(), s, i, size(), r.cache->owners(layer));
+         const auto* bank = p.parameters.layers.at(layer).moe.bank;
+         ops::MoeExpertSource source;
+         source.frame_base = r.cache->frame_base(); source.frames = r.cache->table(layer);
+@@ -925,15 +925,16 @@
+             source.prefetched = r.prefill_stream->slots(layer);
+             source.prefetch_base = r.prefill_stream->base();
+         }
+-        const int owned = (E + size() - 1 - i) / size();
++        const int owned = parallel_expert_count(E, i, size());
+         ops::moe_experts(local_x, dispatch, source, K, std::min(owned, K * T), r.expert_work.p, output, s);
+         if (prefetched && release_stream) { r.prefill_stream->after_experts(layer, s); }
+         Tensor partial(r.expert_partials.p, DType::FP32, {x.ne[0], T});
+-        if (T > 8 && K >= 2 * size()) { ops::moe_combine_owner(output, local, i, size(), partial, s); }
++        if (T > 8 && K >= 2 * size()) { ops::moe_combine_owner(output, local, i, size(), partial, s, r.cache->owners(layer)); }
+         CUDA_CHECK(cudaEventRecord(r.experts_done, s));
+     }
+ }
+-void ParallelExecution::combine_experts(const ops::MoeRouting& routing, const Tensor& outputs,
++const std::int32_t* ParallelExecution::expert_owners(std::uint32_t layer) const { return impl_->primary_cache->owners(layer); }
++void ParallelExecution::combine_experts(std::uint32_t layer, const ops::MoeRouting& routing, const Tensor& outputs,
+     const Tensor& shared, Tensor& y) {
+     auto& p = *impl_; p.primary.bind_to_current_thread();
+     const int H = y.ne[0], T = y.ne[1];
+@@ -944,7 +945,7 @@
+         for (int i = 1; i < size(); ++i) {
+             auto& r = *p.ranks[i]; CUDA_CHECK(cudaStreamWaitEvent(p.primary.stream, r.experts_done, 0));
+             Tensor peer(r.expert_outputs.p, DType::BF16, {outputs.ne[0], outputs.ne[1]});
+-            gather_peer_experts(peer, routing.ids, gathered, i, size(), p.primary.stream);
++            gather_peer_experts(peer, routing.ids, gathered, i, size(), p.primary.stream, p.primary_cache->owners(layer));
+         }
+         ops::moe_combine(gathered, routing, shared, y, p.primary.stream);
+         return;
+@@ -952,7 +953,7 @@
+     // All root expert reads finish in this stream before reusing their output
+     // arena. The last dense projection has already consumed rank0.output.
+     Tensor root(p.ranks.front()->output.p, DType::FP32, {H, T});
+-    ops::moe_combine_owner(outputs, routing, 0, size(), root, p.primary.stream);
++    ops::moe_combine_owner(outputs, routing, 0, size(), root, p.primary.stream, p.primary_cache->owners(layer));
+     Tensor partials(outputs.data, DType::FP32, {H, T, size()});
+     copy_peer_bytes(partials.data, root.data, root.bytes(), p.primary.stream);
+     for (int i = 1; i < size(); ++i) {
+--- a/src/models/qwen4_exp/execution/parallel.h
++++ b/src/models/qwen4_exp/execution/parallel.h
+@@ -46,7 +46,8 @@
+                           Tensor& output);
+     void begin_experts(std::uint32_t layer, const Tensor& x, const ops::MoeRouting& routing,
+                        bool streamed, bool release_stream);
+-    void combine_experts(const ops::MoeRouting& routing, const Tensor& outputs, const Tensor& shared, Tensor& y);
++    void combine_experts(std::uint32_t layer, const ops::MoeRouting& routing, const Tensor& outputs, const Tensor& shared, Tensor& y);
++    const std::int32_t* expert_owners(std::uint32_t layer) const;
+     Tensor attention(const AttentionParameters& parameters, const Tensor& x,
+                      const AttentionCall& call, const Tensor& block_tables,
+                      const ops::PreparedRope& rope, WorkspaceArena& work);
+--- a/src/models/qwen4_exp/head_partition.h
++++ b/src/models/qwen4_exp/head_partition.h
+@@ -4,13 +4,25 @@
+ 
+ namespace infernix::models::qwen4_exp {
+ 
+-// Whole KV heads have one physical owner. Rotate the pair across attention
+-// layers (including the MTP layer); the query group executes on that owner.
++// Isolated fixed-KV candidate. The last four formerly owned experts move off
++// each KV GPU, retaining the established interleaving of all other expert ids.
++inline constexpr bool kRebalanceExperts = true;
++inline int parallel_expert_owner(int layer, int expert, int experts, int layers, int ranks) {
++    (void)layer; (void)layers;
++    const int owner = expert % ranks;
++    return kRebalanceExperts && ranks == 4 && experts == 512 && expert >= 496 && owner < 2 ? owner + 2 : owner;
++}
++inline int parallel_expert_count(int experts, int rank, int ranks) {
++    int count = 0; for (int e = 0; e < experts; ++e) { count += parallel_expert_owner(0, e, experts, 1, ranks) == rank; } return count;
++}
++
++// Whole KV heads have one physical owner. Use the same pair in every attention
++// layer (including MTP); the query group executes on that owner.
+ inline int attention_head_owner(int layer, int head, int kv_heads, int ranks) {
+     if (layer < 0 || head < 0 || head >= kv_heads || kv_heads != 2 || ranks < 2 || ranks > 4) {
+         throw std::invalid_argument("Flash-Next attention requires two KV heads and 2-4 ranks");
+     }
+-    return (std::int64_t(layer) * kv_heads + head) % ranks;
++    return head;
+ }
+ 
+ struct GdnHeadPartition {
+--- a/src/models/qwen4_exp/program/expert_residency.cpp
++++ b/src/models/qwen4_exp/program/expert_residency.cpp
+@@ -1,4 +1,5 @@
+ #include "models/qwen4_exp/program/expert_residency.h"
++#include "models/qwen4_exp/head_partition.h"
+ 
+ #include "models/qwen4_exp/program/host_expert_tier.h"
+ 
+@@ -113,6 +114,17 @@
+     }
+     owner_rank_ = static_cast<std::uint32_t>(rank);
+     owner_count_ = static_cast<std::uint32_t>(count);
++    owner_host_.resize(layers_ * experts_); owned_records_ = 0;
++    for (std::uint32_t l = 0; l < layers_; ++l) for (std::uint32_t e = 0; e < experts_; ++e) {
++        const int owner = parallel_expert_owner(l, e, experts_, layers_, count);
++        owner_host_[l * experts_ + e] = owner; owned_records_ += owner == rank;
++    }
++    owner_device_ = DeviceBuffer(owner_host_.size() * sizeof(std::int32_t));
++    owner_device_.copy_from_host(owner_host_.data(), owner_device_.bytes);
++}
++
++bool ExpertResidency::owns(std::uint32_t layer, std::uint32_t expert) const noexcept {
++    return owner_host_.empty() || owner_host_[layer * experts_ + expert] == int(owner_rank_);
+ }
+ 
+ void ExpertResidency::allow_peer_access(int device) {
+@@ -504,7 +516,7 @@
+         for (std::size_t i = 0; i < used; ++i) {
+             if (!live.empty() && live[i / top_k_] == 0) { continue; }
+             const auto expert = static_cast<std::uint32_t>(ids[i]);
+-            if (expert >= experts_ || expert % owner_count_ != owner_rank_ || seen_[expert]) { continue; }
++            if (expert >= experts_ || !owns(layer, expert) || seen_[expert]) { continue; }
+             seen_[expert] = 1;
+             group_.push_back(layer * experts_ + expert);
+         }
+@@ -604,7 +616,7 @@
+     }
+     std::vector<std::uint32_t> counts(state.counts);
+     for (std::size_t i = 0; i < counts.size(); ++i) {
+-        counts[i] = (i % experts_) % owner_count_ == owner_rank_ ? std::min(counts[i], count_cap) : 0;
++        counts[i] = owns(i / experts_, i % experts_) ? std::min(counts[i], count_cap) : 0;
+     }
+     commands_.clear();
+     // With a tier only keys the warm pre-fill put in RAM can be loaded.
+@@ -612,7 +624,7 @@
+     const std::vector<std::uint32_t>* keys = &state.ranked;
+     if (tier_ != nullptr || owner_count_ > 1) {
+         for (const std::uint32_t key : state.ranked) {
+-            if ((key % experts_) % owner_count_ == owner_rank_ &&
++            if (owns(key / experts_, key % experts_) &&
+                 (tier_ == nullptr || tier_->record(key) != nullptr)) { in_ram.push_back(key); }
+         }
+         keys = &in_ram;
+--- a/src/models/qwen4_exp/program/expert_residency.h
++++ b/src/models/qwen4_exp/program/expert_residency.h
+@@ -91,6 +91,8 @@
+     // Fixed EP ownership; only owned experts enter this cache's policy. Peers
+     // borrow the primary's round lifecycle, but own their allocations and streams.
+     void set_owner(int rank, int count);
++    bool owns(std::uint32_t layer, std::uint32_t expert) const noexcept;
++    const std::int32_t* owners(std::uint32_t layer) const noexcept { return owner_device_.p ? static_cast<const std::int32_t*>(owner_device_.p) + layer * experts_ : nullptr; }
+     void attach_peer(ExpertResidency& cache, DeviceContext& device);
+     // Cache loans can back scratch read by other GPUs. Applies to current and future VMM mappings.
+     void allow_peer_access(int device);
+@@ -144,7 +146,7 @@
+     // Whether the pool can resize after its first size (VMM).
+     [[nodiscard]] bool elastic() const noexcept { return arena_ != nullptr; }
+     [[nodiscard]] std::uint32_t frame_limit() const noexcept {
+-        return std::min(limit_, layers_ * ((experts_ + owner_count_ - 1 - owner_rank_) / owner_count_));
++        return std::min(limit_, owned_records_);
+     }
+     // Bytes the frames occupy now (whole chunks with VMM).
+     [[nodiscard]] std::uint64_t pool_bytes() const noexcept;
+@@ -207,6 +209,9 @@
+     };
+     int device_ = 0;
+     std::uint32_t owner_rank_ = 0, owner_count_ = 1;
++    std::uint32_t owned_records_ = UINT32_MAX;
++    std::vector<std::int32_t> owner_host_;
++    DeviceBuffer owner_device_;
+     std::vector<Peer> peers_;
+     void upload_table(cudaStream_t compute);
+     // Returns every reserved landing frame to the pool.
+--- a/src/models/qwen4_exp/program/program_impl.h
++++ b/src/models/qwen4_exp/program/program_impl.h
+@@ -883,8 +883,8 @@
+                     banks.push_back(reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.device_records));
+                 }
+                 const auto owners = std::max<std::size_t>(1, options_.parallel_devices.size());
+-                record_of = [banks = std::move(banks), record_stride, owners](std::uint32_t layer, std::uint32_t expert) -> const std::uint8_t* {
+-                    if (expert % owners != 0) { return nullptr; }
++                record_of = [banks = std::move(banks), record_stride, owners, layers = c_.num_hidden_layers, experts = c_.moe.experts](std::uint32_t layer, std::uint32_t expert) -> const std::uint8_t* {
++                    if (parallel_expert_owner(layer, expert, experts, layers, owners) != 0) { return nullptr; }
+                     return banks[layer] + static_cast<std::size_t>(expert) * record_stride;
+                 };
+             }
+--- a/src/ops/offloaded_sparse_moe/cuda/moe_layer.cu
++++ b/src/ops/offloaded_sparse_moe/cuda/moe_layer.cu
+@@ -559,7 +559,7 @@
+ // route below.
+ __global__ void __launch_bounds__(kDispatchThreads)
+     dispatch_small_kernel(const std::int32_t* __restrict__ ids, int entries, int experts, MoeDispatch dispatch,
+-                          std::int32_t* __restrict__ route_log, int rank, int ranks) {
++                          std::int32_t* __restrict__ route_log, int rank, int ranks, const std::int32_t* owners) {
+     __shared__ std::int32_t count[kDispatchThreads];
+     __shared__ std::int32_t cursor[kDispatchThreads];
+     __shared__ std::int32_t warp_totals[2][kDispatchThreads / 32];
+@@ -568,7 +568,7 @@
+     __syncthreads();
+     const int id = i < entries ? ids[i] : 0;
+     if (i < entries) {
+-        if (id % ranks == rank) { atomicAdd(&count[id], 1); }
++        if ((owners ? owners[id] : id % ranks) == rank) { atomicAdd(&count[id], 1); }
+         if (route_log != nullptr) { route_log[i] = id; }
+     }
+     __syncthreads();
+@@ -576,16 +576,16 @@
+     if (i < experts) { dispatch.counts[i] = c; }
+     dispatch_scan(c, experts, dispatch.offsets, cursor, dispatch.jobs, dispatch.job_count, warp_totals);
+     __syncthreads();
+-    if (i < entries && id % ranks == rank) { dispatch.entries[atomicAdd(&cursor[id], 1)] = i; }
++    if (i < entries && (owners ? owners[id] : id % ranks) == rank) { dispatch.entries[atomicAdd(&cursor[id], 1)] = i; }
+ }
+ 
+ __global__ void count_kernel(const std::int32_t* __restrict__ ids, int entries,
+                              std::int32_t* __restrict__ counts, std::int32_t* __restrict__ route_log,
+-                             int rank, int ranks) {
++                             int rank, int ranks, const std::int32_t* owners) {
+     const int i = blockIdx.x * blockDim.x + threadIdx.x;
+     if (i < entries) {
+         const int id = ids[i];
+-        if (id % ranks == rank) { atomicAdd(&counts[id], 1); }
++        if ((owners ? owners[id] : id % ranks) == rank) { atomicAdd(&counts[id], 1); }
+         if (route_log != nullptr) { route_log[i] = id; }
+     }
+ }
+@@ -602,9 +602,9 @@
+ 
+ __global__ void scatter_kernel(const std::int32_t* __restrict__ ids, int entries,
+                                std::int32_t* __restrict__ cursor, std::int32_t* __restrict__ out,
+-                               int rank, int ranks) {
++                               int rank, int ranks, const std::int32_t* owners) {
+     const int i = blockIdx.x * blockDim.x + threadIdx.x;
+-    if (i < entries && ids[i] % ranks == rank) { out[atomicAdd(&cursor[ids[i]], 1)] = i; }
++    if (i < entries && (owners ? owners[ids[i]] : ids[i] % ranks) == rank) { out[atomicAdd(&cursor[ids[i]], 1)] = i; }
+ }
+ 
+ // --------------------------------------------------------------------------------------- experts
+@@ -1572,7 +1572,7 @@
+ }
+ 
+ void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& dispatch,
+-                  std::int32_t* route_log, cudaStream_t stream, int owner_rank, int owner_count) {
++                  std::int32_t* route_log, cudaStream_t stream, int owner_rank, int owner_count, const std::int32_t* owners) {
+     require(experts > 0 && experts <= kDispatchThreads, "dispatch supports up to 1024 experts");
+     require(owner_count > 0 && owner_rank >= 0 && owner_rank < owner_count, "invalid expert owner");
+     const int entries = static_cast<int>(routing.ids.numel());
+@@ -1580,20 +1580,20 @@
+     if (entries <= kDispatchThreads) {
+         // Decode and verification widths (k * T <= 1024): one kernel and no memset node.
+         dispatch_small_kernel<<<1, kDispatchThreads, 0, stream>>>(ids, entries, experts, dispatch, route_log,
+-                                                                 owner_rank, owner_count);
++                                                                 owner_rank, owner_count, owners);
+         check_launch("dispatch");
+         return;
+     }
+     require(cudaMemsetAsync(dispatch.counts, 0, sizeof(std::int32_t) * experts, stream) == cudaSuccess,
+             "dispatch could not clear its counts");
+     count_kernel<<<(entries + kThreads - 1) / kThreads, kThreads, 0, stream>>>(ids, entries, dispatch.counts,
+-                                                                                route_log, owner_rank, owner_count);
++                                                                                route_log, owner_rank, owner_count, owners);
+     check_launch("count");
+     scan_kernel<<<1, kDispatchThreads, 0, stream>>>(dispatch.counts, experts, dispatch.offsets, dispatch.cursor,
+                                                     dispatch.jobs, dispatch.job_count);
+     check_launch("scan");
+     scatter_kernel<<<(entries + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+-        ids, entries, dispatch.cursor, dispatch.entries, owner_rank, owner_count);
++        ids, entries, dispatch.cursor, dispatch.entries, owner_rank, owner_count, owners);
+     check_launch("scatter");
+ }
+ 
+--- a/include/infernix/ops/offloaded_sparse_moe.h
++++ b/include/infernix/ops/offloaded_sparse_moe.h
+@@ -67,7 +67,7 @@
+ /// unspecified). When `route_log` is not null it also receives a copy of the k*T ids. The arrays need
+ /// no clearing between calls, so a captured call replays correctly.
+ void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& dispatch,
+-                  std::int32_t* route_log, cudaStream_t stream, int owner_rank = 0, int owner_count = 1);
++                  std::int32_t* route_log, cudaStream_t stream, int owner_rank = 0, int owner_count = 1, const std::int32_t* owners = nullptr);
+ 
+ /// The layer's routed expert records: expert e's record is at frame_base + frames[e] *
+ /// record_stride when frames[e] >= 0, else at host_records + e * record_stride (pinned host
+--- a/tests/cmake/CoreTests.cmake
++++ b/tests/cmake/CoreTests.cmake
+@@ -122,5 +122,8 @@
+ set_tests_properties(infernix_parallel_expert_stream_test PROPERTIES
+   SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;multi-gpu")
+ 
++add_test(NAME infernix_parallel_expert_owners_test COMMAND infernix_offloaded_moe_layer_test --owners)
++set_tests_properties(infernix_parallel_expert_owners_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;multi-gpu")
++
+ infernix_add_op_test(infernix_parallel_combine_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_parallel_combine.cpp" LIBRARIES infernix_ops)
+ set_tests_properties(infernix_parallel_combine_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;multi-gpu")
+--- a/tests/ops/test_offloaded_moe_layer.cu
++++ b/tests/ops/test_offloaded_moe_layer.cu
+@@ -730,7 +730,7 @@
+ // entries as a set, and the route-log copy. The dispatch arrays start as garbage, and a captured
+ // call is replayed on new ids, so neither route may depend on memory cleared outside the call.
+ // Entries <= 1024 take the one-CTA kernel, more the count/scan/scatter kernels.
+-void test_dispatch(int experts, int entries, std::uint32_t seed) {
++void test_dispatch(int experts, int entries, std::uint32_t seed, int owner = 0, int owner_count = 1, int layout = 0) {
+     std::mt19937 rng(seed);
+     std::uniform_int_distribution<int> pick(0, experts - 1);
+     const auto random_ids = [&] {
+@@ -739,6 +739,10 @@
+         for (auto& id : ids) { id = (rng() % 4 == 0) ? pick(rng) % 8 : pick(rng); }
+         return ids;
+     };
++    std::vector<std::int32_t> owners(experts);
++    for (int e = 0; e < experts; ++e) { owners[e] = layout == 1 ? 2 + e / (experts / 2) : layout == 2 ? (e < 124 ? 0 : e < 248 ? 1 : e < 380 ? 2 : 3) : e % owner_count; }
++    std::int32_t* d_owners = nullptr;
++    if (layout) { cuda_check(cudaMalloc(&d_owners, experts * sizeof(std::int32_t)), "owners alloc"); cuda_check(cudaMemcpy(d_owners, owners.data(), experts * sizeof(std::int32_t), cudaMemcpyHostToDevice), "owners copy"); }
+     std::int32_t* d_ids = nullptr;
+     std::int32_t* d_log = nullptr;
+     void* d_dispatch    = nullptr;
+@@ -763,7 +767,7 @@
+                    "copy");
+         cuda_check(cudaMemcpy(log.data(), d_log, sizeof(std::int32_t) * entries, cudaMemcpyDeviceToHost), "copy");
+         std::vector<std::vector<std::int32_t>> by_expert(experts);
+-        for (int i = 0; i < entries; ++i) { by_expert[ids[i]].push_back(i); }
++        for (int i = 0; i < entries; ++i) { if (owners[ids[i]] == owner) { by_expert[ids[i]].push_back(i); } }
+         // The first mismatching field, so a failure names what went wrong.
+         const char* first_bad = log == ids ? nullptr : "route log";
+         int used = 0, start = 0, bad_expert = -1;
+@@ -783,7 +787,7 @@
+             if (first_bad != nullptr) { bad_expert = e; }
+             start += c;
+         }
+-        if (first_bad == nullptr && offsets[experts] != entries) { first_bad = "total offset"; }
++        if (first_bad == nullptr && offsets[experts] != start) { first_bad = "total offset"; }
+         if (first_bad == nullptr && job_count != used) { first_bad = "job count"; }
+         const bool ok = first_bad == nullptr;
+         if (ok) {
+@@ -797,7 +801,7 @@
+ 
+     const auto first = random_ids();
+     cuda_check(cudaMemcpy(d_ids, first.data(), sizeof(std::int32_t) * entries, cudaMemcpyHostToDevice), "copy");
+-    infernix::ops::moe_dispatch(routing, experts, dispatch, d_log, nullptr);
++    infernix::ops::moe_dispatch(routing, experts, dispatch, d_log, nullptr, owner, owner_count, d_owners);
+     cuda_check(cudaDeviceSynchronize(), "dispatch");
+     verify(first, "eager");
+ 
+@@ -806,7 +810,7 @@
+     cudaGraphExec_t exec = nullptr;
+     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
+     cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "capture");
+-    infernix::ops::moe_dispatch(routing, experts, dispatch, d_log, stream);
++    infernix::ops::moe_dispatch(routing, experts, dispatch, d_log, stream, owner, owner_count, d_owners);
+     cuda_check(cudaStreamEndCapture(stream, &graph), "capture");
+     cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+     for (int replay = 0; replay < 2; ++replay) {
+@@ -825,6 +829,7 @@
+     cudaFree(d_dispatch);
+     cudaFree(d_log);
+     cudaFree(d_ids);
++    cudaFree(d_owners);
+ }
+ 
+ } // namespace
+@@ -835,6 +840,12 @@
+         return 77;
+     }
+     try {
++        if (argc == 2 && std::strcmp(argv[1], "--owners") == 0) {
++            for (int layout : {0, 1, 2}) for (int rank = 0; rank < 4; ++rank) {
++                for (int entries : {1, 10, 1024, 1025, 20480}) { test_dispatch(512, entries, 100U + entries, rank, 4, layout); }
++            }
++            return g_failures == 0 ? 0 : 1;
++        }
+         if (argc == 2 && std::strcmp(argv[1], "--multi-device") == 0) {
+             int devices = 0;
+             cuda_check(cudaGetDeviceCount(&devices), "device count");
+--- a/tests/test_parallel_partition.cpp
++++ b/tests/test_parallel_partition.cpp
+@@ -34,8 +34,9 @@
+                 const int b = q::attention_head_owner(layer, 1, 2, ranks);
+                 check(a != b, "attention heads share an owner"); ++owned[a]; ++owned[b];
+             }
+-            for (int n : owned) { check(n == 24 / ranks, "attention owner rotation is unbalanced"); }
++            for (int r = 0; r < ranks; ++r) { check(owned[r] == (r < 2 ? 12 : 0), "fixed attention ownership mismatch"); }
+         }
++        for (int r = 0; r < 4; ++r) { check(q::parallel_expert_count(512, r, 4) == (q::kRebalanceExperts ? (r < 2 ? 124 : 132) : 128), "fixed KV expert rebalance counts"); }
+         for (int rows : {1, 16, 48, 96, 320, 324, 640, 1280, 2560, 13952, 16384, 248320, INT_MAX}) {
+             for (int ranks : {1, 2, 3, 4}) {
+                 std::int64_t cursor = 0;
+--- a/tests/test_parallel_transport.cpp
++++ b/tests/test_parallel_transport.cpp
+@@ -267,7 +267,7 @@
+     root.bind_to_current_thread();
+ }
+ 
+-void test_experts(std::vector<std::unique_ptr<Rank>>& ranks) {
++void test_experts(std::vector<std::unique_ptr<Rank>>& ranks, bool mapped = false) {
+     const int count = static_cast<int>(ranks.size());
+     auto& root = ranks.front()->device;
+     constexpr int experts = 512, hidden = 2560, top_k = 10;
+@@ -275,6 +275,10 @@
+         const int entries = top_k * columns;
+         root.bind_to_current_thread();
+         DeviceBuffer ids(entries * 4), combined(std::size_t(hidden) * entries * 2);
++        std::vector<std::int32_t> owner_map(experts);
++        for (int e = 0; e < experts; ++e) { owner_map[e] = mapped ? (e < experts / 2 ? 0 : 1 + (e % (count - 1))) : e % count; }
++        DeviceBuffer map(experts * 4); map.copy_from_host(owner_map.data(), map.bytes);
++        const auto* table = mapped ? static_cast<const std::int32_t*>(map.p) : nullptr;
+         Tensor output(combined.p, DType::BF16, {hidden, entries});
+         Tensor id_view(ids.p, DType::I32, {top_k, columns});
+         for (int pattern = 0; pattern < 2; ++pattern) {
+@@ -290,7 +294,7 @@
+                 auto dispatch = ops::carve_moe_dispatch(rank.dispatch.p, experts, entries);
+                 ops::MoeRouting routing;
+                 routing.ids = Tensor(rank.ids.p, DType::I32, {top_k, columns});
+-                ops::moe_dispatch(routing, experts, dispatch, nullptr, rank.device.stream, r, count);
++                ops::moe_dispatch(routing, experts, dispatch, nullptr, rank.device.stream, r, count, table);
+                 rank.device.synchronize();
+                 std::vector<int> counts(experts), offsets(experts + 1), jobs(experts), positions(entries);
+                 int job_count = -1;
+@@ -301,27 +305,27 @@
+                 CUDA_CHECK(cudaMemcpy(positions.data(), dispatch.entries, entries * 4, cudaMemcpyDeviceToHost));
+                 int total = 0, expected_jobs = 0;
+                 for (int e = 0; e < experts; ++e) {
+-                    const int expected = e % count == r ? static_cast<int>(std::count(selected.begin(), selected.end(), e)) : 0;
++                    const int expected = owner_map[e] == r ? static_cast<int>(std::count(selected.begin(), selected.end(), e)) : 0;
+                     require(counts[e] == expected && offsets[e] == total, "expert ownership/count mismatch");
+                     if (expected) { require(jobs[expected_jobs++] == e, "expert job order mismatch"); }
+                     std::vector<int> found;
+                     for (int n = 0; n < expected; ++n) { found.push_back(positions[total + n]); }
+                     std::sort(found.begin(), found.end());
+                     std::vector<int> oracle;
+-                    for (int n = 0; n < entries; ++n) if (selected[n] == e && e % count == r) { oracle.push_back(n); }
++                    for (int n = 0; n < entries; ++n) if (selected[n] == e && owner_map[e] == r) { oracle.push_back(n); }
+                     require(found == oracle, "expert entry permutation mismatch");
+                     total += expected;
+                 }
+                 require(offsets.back() == total && job_count == expected_jobs, "expert dispatch terminal count mismatch");
+                 rank.output = DeviceBuffer(std::size_t(hidden) * entries * 2);
+                 std::vector<std::uint16_t> values(std::size_t(hidden) * entries, 0xFFFF);
+-                for (int e = 0; e < entries; ++e) if (selected[e] % count == r) {
++                for (int e = 0; e < entries; ++e) if (owner_map[selected[e]] == r) {
+                     for (int h = 0; h < hidden; ++h) { values[std::size_t(e) * hidden + h] = std::uint16_t((e * 13 + h) % 65535); }
+                 }
+                 rank.output.copy_from_host(values.data(), values.size() * 2);
+                 root.bind_to_current_thread();
+                 Tensor peer(rank.output.p, DType::BF16, {hidden, entries});
+-                gather_peer_experts(peer, id_view, output, r, count, root.stream);
++                gather_peer_experts(peer, id_view, output, r, count, root.stream, table);
+                 root.synchronize();
+             }
+             std::vector<std::uint16_t> got(std::size_t(hidden) * entries);
+@@ -334,7 +338,7 @@
+                 auto& rank = *ranks[r]; rank.device.bind_to_current_thread();
+                 Tensor peer(rank.output.p, DType::BF16, {hidden, entries});
+                 Tensor local_ids(rank.ids.p, DType::I32, {top_k, columns});
+-                gather_peer_experts(peer, local_ids, output, r, count, rank.device.stream);
++                gather_peer_experts(peer, local_ids, output, r, count, rank.device.stream, table);
+                 CUDA_CHECK(cudaEventRecord(rank.done, rank.device.stream));
+             }
+             root.bind_to_current_thread();
+@@ -388,6 +392,7 @@
+         test_broadcast(ranks);
+         for (std::size_t owner = 0; owner < ranks.size(); ++owner) { test_peer_arena(ranks, owner); }
+         test_experts(ranks);
++        test_experts(ranks, true);
+         std::printf("PASS: %d GPUs, exact row gather, eager/captured replay, expert dispatch and output gather\n", count);
+         return 0;
+     } catch (const std::exception& error) {

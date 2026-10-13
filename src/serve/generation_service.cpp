@@ -314,6 +314,9 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
                                                                                             ".expert-state");
     engine_options.thinking_budget_message  = options_.thinking_budget_message;
     engine_options.device                   = options_.device;
+    engine_options.parallel_devices         = options_.parallel_devices;
+    engine_options.pipeline_parallel = options_.pipeline_parallel;
+    engine_options.fixed_kv_owners = options_.fixed_kv_owners;
     engine_options.max_context              = options_.max_context;
     engine_options.rope_yarn_factor          = options_.rope_yarn_factor;
     engine_options.kv_capacity              = options_.kv_capacity;

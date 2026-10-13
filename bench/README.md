@@ -111,6 +111,13 @@ Select a backend with `--spec mtp|dflash|dflash2 --draft-tokens K` (MTP K=1..5, 
 K=1..15); `--lm-head-draft` selects the optimized proposal head. CUDA Graph decode is
 enabled by default.
 
+Experimental Flash-Next runs accept `--parallel-devices 0,1,2,3`, with optional
+`--pipeline-parallel` (TP2+PP2) or `--fixed-kv-owners` (TP4 with KV on the first
+two GPUs). The two layout flags are mutually exclusive and require four devices.
+JSON records the GPU list and both flags; runtime memory fields describe the
+primary GPU, not aggregate VRAM. Use the [target-host runner](../tools/tp4/README.md)
+for per-GPU monitoring and the required 131,072-token INT8 capacity comparisons.
+
 `--profile-measured` is a benchmark-only profiler boundary. It requires exactly one selected test
 and `-r 1`, synchronizes after warmup, and brackets only the measured repetition with
 `cudaProfilerStart/Stop`. Use it with an Nsight Systems `cudaProfilerApi` capture range so artifact
@@ -133,6 +140,8 @@ of at least two. Warmups use the same mixture and compile constraints before mea
 time. Per-request phase rates remain separate from this aggregate throughput.
 
 The benchmark disables context retention because every repetition is an independent root request.
+JSON repetitions include `generated_token_ids` for exact output comparisons between builds;
+matching token sequences establish agreement on that workload, not general model quality.
 Schema v16 records `speculative_backend`, `draft_tokens`, and the proposal head independently;
 JSON and CSV identify DFlash2 explicitly. MTP alone reserves its extra lookahead KV margin.
 Schema v20 adds `rope_yarn_factor`, `ngram_draft_tokens` and `ngram_min_match` to `config`.

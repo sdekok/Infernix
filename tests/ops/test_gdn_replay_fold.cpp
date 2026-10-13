@@ -33,7 +33,7 @@ using namespace infernix::test;
 namespace {
 
 constexpr std::int32_t kStateDim       = 128;
-constexpr std::int32_t kQkHeads        = 16;
+std::int32_t kQkHeads = 16;
 constexpr std::int32_t kRecordCapacity = 8;
 constexpr std::size_t kGuardBytes      = 256;
 
@@ -795,6 +795,17 @@ int main(int argc, char** argv) {
     }
 
     int failures = 0;
+    if (argc == 2 && std::string(argv[1]) == "--shards-only") {
+        for (int heads : {4, 5, 6, 8}) {
+            kQkHeads = heads;
+            failures += run_case({36, heads * 3, heads * 640}, 5, 3, {5, 3, 0}, 83100U + heads, true);
+            failures += run_case({36, heads * 3, heads * 640}, 17, 1, {13}, 83200U + heads, true);
+        }
+        kQkHeads = 8;
+        failures += run_case({18, 24, 5120}, 5, 3, {5, 3, 0}, 83308U, true);
+        failures += run_case({18, 24, 5120}, 17, 1, {13}, 83408U, true);
+        return failures ? 1 : 0;
+    }
     if (argc >= 2 && std::string(argv[1]) == "--wide-only") {
         // The wide sweep splits into independent parts that CTest runs concurrently: every
         // commit of one width (--width 33|48|64) for one profile (--layers 48|30), and the

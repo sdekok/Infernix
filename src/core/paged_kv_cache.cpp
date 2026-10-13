@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <limits>
 #include <new>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -88,9 +89,24 @@ DeviceKVPagePoolLayout plan_device_kv_page_pool(LayoutBuilder& builder,
                 {plane.leading_extent, kPagedKVPageSize, plane.head_extent, physical_pages},
                 plane.alignment, label);
         } else {
+            const std::size_t page_bytes = std::size_t(plane.leading_extent) * kPagedKVPageSize * dtype_size(plane.dtype);
+            const auto alignment = plane.head_alignment;
+            if (!alignment || (alignment & (alignment - 1))) {
+                throw std::invalid_argument("Paged KV head alignment must be a power of two");
+            }
+            const auto page_alignment = alignment / std::gcd(alignment, page_bytes);
+            if (page_alignment > std::numeric_limits<std::int32_t>::max()) {
+                throw std::overflow_error("Paged KV head alignment exceeds int32 pages");
+            }
+            const auto count = (std::size_t(physical_pages) + page_alignment - 1) / page_alignment * page_alignment;
+            if (count > std::numeric_limits<std::int32_t>::max()) {
+                throw std::overflow_error("Paged KV padded page count exceeds int32");
+            }
+            // Backing includes padding after each head; the pool view retains
+            // the logical page count and this padded head pitch.
             planned.storage = builder.add_tensor(
                 plane.dtype,
-                {plane.leading_extent, kPagedKVPageSize, physical_pages, plane.head_extent},
+                {plane.leading_extent, kPagedKVPageSize, static_cast<std::int32_t>(count), plane.head_extent},
                 plane.alignment, label);
         }
         layout.planes.push_back(planned);
@@ -216,6 +232,8 @@ DeviceKVPagePool::DeviceKVPagePool(DeviceSpan backing, const DeviceKVPagePoolLay
             throw std::logic_error("Paged KV device plane layout does not match its geometry");
         }
         Tensor plane = planned.storage.bind(backing);
+        if (spec_.geometry.device_plane_order == PagedKVPlaneOrder::HeadMajor &&
+            plane.ne[2] >= physical_pages) { plane.ne[2] = physical_pages; }
         if (plane.dtype != expected.dtype || plane.ne[0] != expected.leading_extent ||
             plane.ne[1] != kPagedKVPageSize) {
             throw std::logic_error("Paged KV device plane tensor is inconsistent");

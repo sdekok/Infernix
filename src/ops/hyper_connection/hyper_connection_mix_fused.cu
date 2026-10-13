@@ -22,6 +22,8 @@
 // columns share the call.
 
 #include "ops/hyper_connection/hyper_connection_mix_fused.h"
+#include "infernix/ops/hyper_connection.h"
+#include "core/device.h"
 
 #include "core/pdl.cuh"
 #include "ops/common/math.cuh"
@@ -246,12 +248,13 @@ template <class Codec>
 __global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_kernel(
     const float* __restrict__ partial, const float* __restrict__ inv_in, const bf16* __restrict__ residual,
     const bf16* __restrict__ norm_weight, typename Codec::Params up, int rank, int down_rows, int columns,
-    float* __restrict__ inject, bf16* __restrict__ x) {
+    float* __restrict__ inject, bf16* __restrict__ x, int first_feature, int feature_count) {
     __shared__ __align__(16) float m[kHcMixFusedMaxColumns * kMaxRank]; // [T][rank]
     __shared__ float inv[kStreams * kHcMixFusedMaxColumns];             // [S][T]
     const int lane = static_cast<int>(threadIdx.x) & 31, warp = static_cast<int>(threadIdx.x) >> 5;
-    const int d    = static_cast<int>(blockIdx.x) * kUpFeatures + warp;
-    const bool live = d < kHidden;
+    const int local_d = static_cast<int>(blockIdx.x) * kUpFeatures + warp;
+    const int d = first_feature + local_d;
+    const bool live = local_d < feature_count;
     constexpr int width = kStreams * kHidden;
     const int chunks    = rank / 8;
 
@@ -259,7 +262,7 @@ __global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_kernel(
     typename Codec::Chunk chunk[kStreams][2];
 #pragma unroll
     for (int s = 0; s < kStreams; ++s) {
-        const std::int64_t row = static_cast<std::int64_t>(s) * kHidden + (live ? d : 0);
+        const std::int64_t row = static_cast<std::int64_t>(s) * feature_count + (live ? local_d : 0);
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
             const int c = lane + 32 * h;
@@ -353,7 +356,7 @@ __global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_kernel(
                 const float rn = r[s] * inv[s * columns + t] * w_bias[s];
                 sum += sigmoidf(acc[s]) * rn;
             }
-            x[static_cast<std::int64_t>(t) * kHidden + d] = __float2bfloat16_rn(sum * inv_streams);
+            x[static_cast<std::int64_t>(t) * feature_count + local_d] = __float2bfloat16_rn(sum * inv_streams);
         }
     }
 }
@@ -408,7 +411,7 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
                                       static_cast<const float*>(inv), static_cast<const bf16*>(residual.data),
                                       static_cast<const bf16*>(norm_weight.data), up, rank, down_rows, columns,
                                       inject != nullptr ? static_cast<float*>(inject->data) : nullptr,
-                                      static_cast<bf16*>(x.data)),
+                                      static_cast<bf16*>(x.data), 0, kHidden),
                  "up collapse");
 }
 
@@ -447,3 +450,58 @@ void hc_mix_fused(const Tensor& residual, const Tensor& norm_weight, const Weigh
 }
 
 } // namespace infernix::ops::detail
+
+namespace infernix::ops {
+bool hyper_connection_fused_supported(const Weight& down, const Weight& up, int hidden,
+                                     int streams, int rank, int columns) noexcept {
+    // Logical TP metadata deliberately has no resident full-matrix pointers.
+    return (down.qtype == QType::BF16 || down.qtype == QType::Q8_G32_FP16) && up.qtype == down.qtype &&
+           hidden == 2560 && streams == 4 && rank > 0 && rank <= 512 && rank % 8 == 0 &&
+           columns >= 1 && columns <= detail::kHcMixFusedMaxColumns;
+}
+
+template<class Codec>
+void down_partition(const Tensor& residual, const Tensor& norm, typename Codec::Params down, int rows,
+                    float epsilon, void* partials, void* inverse, cudaStream_t stream) {
+    CUDA_CHECK(cudaFuncSetAttribute(detail::hc_down_partials_kernel<Codec>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(detail::kDownSharedBytes)));
+    detail::hc_down_partials_kernel<Codec><<<dim3((rows + 7) / 8, 4), 256, detail::kDownSharedBytes, stream>>>(
+        static_cast<const __nv_bfloat16*>(residual.data), static_cast<const __nv_bfloat16*>(norm.data),
+        down, rows, residual.ne[1], epsilon, static_cast<float*>(partials), static_cast<float*>(inverse));
+    CUDA_CHECK(cudaGetLastError());
+}
+void hyper_connection_down_partition(const Tensor& residual, const Tensor& norm, const Weight& down,
+                                     float epsilon, void* partials, void* inverse, cudaStream_t stream) {
+    if (residual.ne[0] != 10240 || residual.ne[1] < 1 || residual.ne[1] > 16 || down.k != 10240 || down.n <= 0) {
+        throw std::invalid_argument("HC down partition: invalid geometry");
+    }
+    if (down.qtype == QType::Q8_G32_FP16) {
+        down_partition<detail::Q8Codec>(residual, norm, detail::q8_params(down), down.n, epsilon, partials, inverse, stream);
+    } else if (down.qtype == QType::BF16) {
+        down_partition<detail::Bf16Codec>(residual, norm, detail::bf16_params(down), down.n, epsilon, partials, inverse, stream);
+    } else { throw std::invalid_argument("HC down partition: unsupported codec"); }
+}
+template<class Codec>
+void up_partition(const Tensor& residual, const Tensor& norm, typename Codec::Params up, int rows, int rank,
+                  int first, const void* partials, const void* inverse, Tensor& output, Tensor* inject,
+                  cudaStream_t stream) {
+    detail::hc_up_collapse_kernel<Codec><<<(output.ne[0] + 15) / 16, 512, 0, stream>>>(
+        static_cast<const float*>(partials), static_cast<const float*>(inverse),
+        static_cast<const __nv_bfloat16*>(residual.data), static_cast<const __nv_bfloat16*>(norm.data),
+        up, rank, rows, residual.ne[1], inject ? static_cast<float*>(inject->data) : nullptr,
+        static_cast<__nv_bfloat16*>(output.data), first, output.ne[0]);
+    CUDA_CHECK(cudaGetLastError());
+}
+void hyper_connection_up_partition(const Tensor& residual, const Tensor& norm, const Weight& up,
+                                   int rows, int rank, int first, const void* partials, const void* inverse,
+                                   Tensor& output, Tensor* inject, cudaStream_t stream) {
+    if (up.n != 4 * output.ne[0] || first < 0 || first + output.ne[0] > 2560 || residual.ne[1] > 16) {
+        throw std::invalid_argument("HC up partition: invalid geometry");
+    }
+    if (up.qtype == QType::Q8_G32_FP16) {
+        up_partition<detail::Q8Codec>(residual, norm, detail::q8_params(up), rows, rank, first, partials, inverse, output, inject, stream);
+    } else if (up.qtype == QType::BF16) {
+        up_partition<detail::Bf16Codec>(residual, norm, detail::bf16_params(up), rows, rank, first, partials, inverse, output, inject, stream);
+    } else { throw std::invalid_argument("HC up partition: unsupported codec"); }
+}
+} // namespace infernix::ops

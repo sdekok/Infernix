@@ -3,6 +3,10 @@
 `build/apps/infernix-serve` loads one v3 `.infernix` (or `.ninfer`) artifact and exposes OpenAI- and
 Anthropic-compatible HTTP endpoints over one resident Infernix Engine.
 
+For the experimental Flash-Next multi-GPU path, add
+`--device 0 --parallel-devices 0,1,2,3`; the
+[same requirements and limitations](qwen3_8-flash-next.md#experimental-multi-gpu) apply.
+
 ## Start the server
 
 See [CUDA synchronization](cli.md#cuda-synchronization) for the shared `INFERNIX_CUDA_SYNC` setting.
@@ -1183,6 +1187,9 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--log-colours on\|off` | colour the console statistics lines; never applies to file logs | `off` |
 | `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | pretty stderr verbosity | `info` |
 | `--device N` | CUDA device index | `0` |
+| `--parallel-devices IDS` | experimental Flash-Next TP/EP over 2–4 SM120 GPUs with all-pairs P2P; primary ordinal first | single GPU |
+| `--pipeline-parallel` | experimental TP2+PP2 on four selected GPUs; intended for long prompts, costs primary workspace/cache capacity | off |
+| `--fixed-kv-owners` | keep all attention KV and matching projection rows on the first two TP4 GPUs; incompatible with pipeline mode | off |
 | `--ram-headroom-mib N` | physical Host RAM in MiB that pinned weights and caches leave free for the system; startup refuses a lock that would take it (Qwen3.8-Flash-Next plans every allocation against it in its RAM ledger) | `2048` |
 | `--expert-ram-mib N\|auto` | Qwen3.8-Flash-Next: Host RAM in MiB for the routed experts; less than all of them need (~64.5 GiB) keeps that many in RAM and reads the rest from the artifact ([SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier)); more than is free is an error | `auto` (what the ledger leaves) |
 | `--context-cost-presets FILE` | optional runtime context-cost preset registry | generic + compiled defaults |

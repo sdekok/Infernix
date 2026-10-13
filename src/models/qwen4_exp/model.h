@@ -7,6 +7,7 @@
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/expert_store.h"
 #include "models/qwen4_exp/weights.h"
+#include "models/qwen4_exp/parallel_weights.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
 
 #include <memory>
@@ -53,6 +54,9 @@ public:
     [[nodiscard]] const TextWeights& weights() const noexcept { return weights_; }
     [[nodiscard]] const BoundWeight& weight(WeightId id) const { return bound_.at(id.index); }
     [[nodiscard]] std::span<const BoundWeight> weight_data() const noexcept { return bound_; }
+    [[nodiscard]] const PartitionedWeight* parallel_weight(const WeightParent* parent) const noexcept {
+        return parallel_weights_ ? parallel_weights_->find(parent) : nullptr;
+    }
     [[nodiscard]] std::span<const ExpertBank> expert_banks() const noexcept { return banks_; }
     // With LoadOptions::stream_experts: where each record lies in the artifact (the banks then
     // hold no records, only their layout and multipliers).
@@ -60,7 +64,7 @@ public:
     [[nodiscard]] const FrontendResources& resources() const noexcept { return resources_; }
     [[nodiscard]] const InstanceInfo& info() const noexcept { return info_; }
     [[nodiscard]] const artifact::MaterializationStats& storage_stats() const noexcept {
-        return backing_.stats();
+        return storage_stats_;
     }
     // With vision offload: the pinned tower and its staging layout (no evictable pool: the encode
     // window borrows device memory from the expert cache, design §19.3.2).
@@ -78,6 +82,8 @@ private:
 
     // Borrowers are declared after the backing they view, so they are destroyed first.
     artifact::MaterializedArtifact backing_;
+    artifact::MaterializationStats storage_stats_;
+    std::unique_ptr<ParallelWeightStorage> parallel_weights_;
     std::optional<ExpertStore> expert_store_; // the streamed banks' multipliers back banks_
     Config config_;
     LoadOptions options_;

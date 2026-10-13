@@ -4,6 +4,7 @@
 
 #include "infernix/ops/qsa.h"
 #include "infernix/ops/rope.h"
+#include "core/cuda_function_attributes.h"
 
 #include "core/paged_kv_storage.h"
 #include "core/pdl.cuh"
@@ -982,6 +983,13 @@ void require_batch(const QsaBatch& b, int columns) {
             "batch description is invalid");
 }
 
+void require_selection(const QsaSelection& selection, const QsaGeometry& geometry, int columns) {
+    require(contiguous(selection.blocks, DType::I32) && selection.blocks.ne[0] == geometry.budget / geometry.ratio &&
+                selection.blocks.ne[1] == columns && selection.blocks.ne[2] == 1 && selection.blocks.ne[3] == 1 &&
+                contiguous(selection.counts, DType::I32) && selection.counts.numel() == columns,
+            "selection shapes disagree");
+}
+
 } // namespace
 
 void qsa_index_query(Tensor& q, const Tensor& norm_weight, const Tensor& rope_positions,
@@ -1067,10 +1075,30 @@ std::size_t qsa_attention_workspace_bytes(const QsaGeometry& geometry, std::int3
     return std::max(bytes, small);
 }
 
+std::size_t qsa_selection_workspace_bytes(const QsaGeometry& geometry, std::int32_t columns,
+                                          std::int32_t max_context) {
+    require_geometry(geometry);
+    return detail::qsa_select_scratch_bytes(geometry, columns, max_context);
+}
+
+void qsa_select_blocks(const Tensor& index_q, const QsaKVLayer& layer, const QsaBatch& batch,
+    const QsaGeometry& geometry, std::int32_t max_context, void* workspace,
+    std::size_t workspace_bytes, QsaSelection& selection, cudaStream_t stream) {
+    require_geometry(geometry);
+    const int columns = index_q.ne[2];
+    require_batch(batch, columns);
+    require_selection(selection, geometry, columns);
+    require(contiguous(index_q, DType::BF16) && index_q.ne[0] == kIndexDim &&
+                index_q.ne[1] == geometry.index_heads, "index query shapes disagree");
+    detail::qsa_select(index_q, layer.pooled_pages, batch, geometry, max_context, workspace, workspace_bytes,
+        {static_cast<std::int32_t*>(selection.blocks.data), static_cast<std::int32_t*>(selection.counts.data)},
+        stream, layer.spaces);
+}
+
 void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& layer,
                    const QsaBatch& batch, const QsaGeometry& geometry, float scale,
                    std::int32_t max_context, void* workspace, std::size_t workspace_bytes,
-                   Tensor& out, cudaStream_t stream, const QsaAppend* append) {
+                   Tensor& out, cudaStream_t stream, const QsaAppend* append, const QsaSelection* selection) {
     require_geometry(geometry);
     const int columns = q.ne[2];
     require_batch(batch, columns);
@@ -1088,6 +1116,11 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
     std::size_t need = 0;
     Workspace ws     = carve(workspace, geometry, columns, max_context, staged, need);
     require(workspace != nullptr && workspace_bytes >= need, "workspace is too small");
+    if (selection) {
+        require_selection(*selection, geometry, columns);
+        ws.selected = static_cast<std::int32_t*>(selection->blocks.data);
+        ws.counts = static_cast<std::int32_t*>(selection->counts.data);
+    }
     // The vector-quantized append: paged codes, and the window slots of a narrow call or the staged
     // rows of a wide one (committed after attention).
     PagedKVBatchLayerView cache{.k_pages       = layer.kv.k_pages,
@@ -1138,8 +1171,10 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
     const int stride     = batch.block_tables.ne[0];
     const auto* rows     = static_cast<const std::int32_t*>(batch.table_rows.data);
     const auto* pos      = static_cast<const std::int32_t*>(batch.positions.data);
-    detail::qsa_select(index_q, layer.pooled_pages, batch, geometry, max_context, ws.select, ws.select_bytes,
-                       {ws.selected, ws.counts}, stream, layer.spaces);
+    if (!selection) {
+        detail::qsa_select(index_q, layer.pooled_pages, batch, geometry, max_context, ws.select, ws.select_bytes,
+                           {ws.selected, ws.counts}, stream, layer.spaces);
+    }
     // Calls this kernel would run unsplit take the Tensor Core prompt route (qsa_prompt.h): the same
     // width-invariance class, so a column's bits still do not depend on its call's width there.
     const int splits = attention_splits(columns, geometry);
@@ -1157,12 +1192,7 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
         using Shared                = AttentionShared<Storage, Group, Stages>;
         constexpr std::size_t bytes = Shared::kBytes;
         constexpr auto kernel       = attention_kernel<Storage, Group, Exact, Stages>;
-        static const bool reserved  = [] {
-            return cudaFuncSetAttribute(attention_kernel<Storage, Group, Exact, Stages>,
-                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        static_cast<int>(Shared::kBytes)) == cudaSuccess;
-        }();
-        require(reserved, "attention shared memory cannot be reserved");
+        prepare_cuda_shared<kernel>(static_cast<int>(bytes));
         const cudaError_t error = pdl::launch_consumer(
             {grid, dim3(kAttentionThreads), bytes, stream}, kernel, static_cast<const bf16*>(q.data), geometry.heads,
             geometry.kv_heads, layer.kv, layer.spaces, tables, stride, rows, pos, batch.width, geometry.ratio,

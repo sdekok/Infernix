@@ -183,7 +183,7 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
         throw std::invalid_argument("kv_cache_append: positions must be I32");
     }
     const std::int32_t kv_heads = k.ne[1];
-    if (kv_heads != 4 && kv_heads != 2) {
+    if (kv_heads != 4 && kv_heads != 2 && kv_heads != 1) {
         throw std::invalid_argument("kv_cache_append: unsupported KV head geometry");
     }
     const std::int32_t tokens = k.ne[2];
@@ -216,7 +216,7 @@ void kv_cache_append_batch(const Tensor& k, const Tensor& v, const Tensor& posit
         throw std::invalid_argument("kv_cache_append_batch: k/v must be BF16, positions and rows I32");
     }
     const std::int32_t kv_heads = k.ne[1], tokens = k.ne[2], batch = k.ne[3];
-    if ((kv_heads != 4 && kv_heads != 2) || tokens <= 0 || batch <= 0) {
+    if ((kv_heads != 4 && kv_heads != 2 && kv_heads != 1) || tokens <= 0 || batch <= 0) {
         throw std::invalid_argument("kv_cache_append_batch: unsupported geometry");
     }
     require_shape(k, kFullHeadDim, kv_heads, tokens, batch, kAppendOp, "k");

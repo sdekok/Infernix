@@ -80,8 +80,11 @@ void dispatch(const Tensor& k, const Tensor& v, const Tensor& positions, const C
         if (k.ne[1] == KVCacheAppendD256Kv4::KVHeads)
             launch_for<KVCacheAppendD256Kv4, Codec, Mode, MultiBatch>(k, v, positions, cache,
                                                                       metadata, window, stream);
-        else
+        else if (k.ne[1] == 2)
             launch_for<KVCacheAppendD256Kv2, Codec, Mode, MultiBatch>(k, v, positions, cache,
+                                                                      metadata, window, stream);
+        else
+            launch_for<KVCacheAppendD256Kv1, Codec, Mode, MultiBatch>(k, v, positions, cache,
                                                                       metadata, window, stream);
     };
     if (cache.storage == KvCacheStorage::Vq2)
@@ -192,8 +195,11 @@ void kv_cache_vq_window_commit_launch(const KVCacheVqStaging& staging, const Ten
     if (cache.num_kv_heads == 4)
         kv_cache_vq_window_commit_kernel<4><<<grid, kBlock, 0, stream>>>(
             staging, pos, valid, window_slots(cache.window), width);
-    else
+    else if (cache.num_kv_heads == 2)
         kv_cache_vq_window_commit_kernel<2><<<grid, kBlock, 0, stream>>>(
+            staging, pos, valid, window_slots(cache.window), width);
+    else
+        kv_cache_vq_window_commit_kernel<1><<<grid, kBlock, 0, stream>>>(
             staging, pos, valid, window_slots(cache.window), width);
     CUDA_CHECK(cudaGetLastError());
 }

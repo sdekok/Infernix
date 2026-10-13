@@ -60,7 +60,7 @@ public:
     // frame or -1, as the chunk's kernels see them). On `compute`: uploads the slot tables; on the
     // copy stream, behind `compute`'s work so far, the copies of layers 0 and 1.
     // `gated`: no copies now; plan_layer enqueues each layer's.
-    void begin(DeviceSpan ring, const std::int32_t* residency, cudaStream_t compute, bool gated = false);
+    void begin(DeviceSpan ring, const std::int32_t* residency, cudaStream_t compute, bool gated = false, std::uint32_t first = 0, std::uint32_t end = UINT32_MAX);
     // A gated chunk's layer `layer`, in layer order: copies (and the slot table of) every expert with
     // columns[e] > 0 that is not resident and has cpu[e] == 0, up to the layer's half, behind the
     // release of layer - 2's half. Returns how many it copies.
@@ -90,7 +90,7 @@ public:
 private:
     void enqueue(std::uint32_t layer);
 
-    std::uint32_t experts_ = 0, layers_ = 0;
+    std::uint32_t experts_ = 0, layers_ = 0, first_ = 0, end_ = 0;
     std::uint64_t stride_  = 0;
     RecordOf record_of_;
     Hold hold_;

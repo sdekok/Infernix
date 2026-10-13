@@ -22,7 +22,7 @@ struct KVCacheAppendPrefixExecutionEnvelope {
 /**
  * Append every K/V row to single-sequence paged growing-cache storage.
  *
- * k/v are contiguous BF16 [256,4|2,T] and positions is contiguous sequential device I32 [T].
+ * k/v are contiguous BF16 [256,4|2|1,T] and positions is contiguous sequential device I32 [T].
  * BF16 cache mode copies K bit-for-bit and stores V as FP16_RNE(BF16 input). INT8-G64 cache rows
  * use one scale for each contiguous 64-value group. For codec input values x, the persistent
  * INT8 group encoding is
@@ -78,7 +78,7 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
 /**
  * Append whole columns of B sequences to full-head (D=256) paged storage.
  *
- * k/v are contiguous BF16 [256,Hkv,T,B] with Hkv 2 or 4, positions is contiguous device I32 [T,B]
+ * k/v are contiguous BF16 [256,Hkv,T,B] with Hkv 1, 2 or 4, positions is contiguous device I32 [T,B]
  * and table_rows contiguous device I32 [B]. Column (t,b) is stored at logical position
  * positions[t,b] through table row table_rows[b] with kv_cache_append's storage conversions, every
  * storage included. With a vector-quantized storage's exact window, each sequence's window slots

@@ -53,6 +53,42 @@ After building, `ctest --preset dev` runs the same CTest suite. See
 
 The chat-template reference test uses Python Jinja2.
 
+The experimental Flash-Next multi-GPU checks use small synthetic artifacts and
+independent FP64 oracles on 2–4 SM120 GPUs with P2P access. See
+[isolated build and test commands](../tools/tp4/README.md) for the partition,
+transport, weight-storage, shared-expert, HC, resident-expert, physical KV/state
+ownership, canonical snapshot, owned-head QSA and GDN/replay checks. These
+also cover GDN gating/convolution shard shapes and successive-device CUDA
+kernel initialization in one process, including narrow/wide offloaded experts.
+Owner-local attention adds FP64 normalization/RoPE checks at 12 query heads and
+one KV head, including wide prompts and captured replay. Exact transport checks
+include rotating two-owner attention all-gather, recurrent-output all-gather and peer access
+to expert VMM loans before and after growth/remapping, in eager and captured
+execution. The owned expert-stream check verifies record bytes and exclusion of
+resident, remote-owned and CPU-served experts for one through four owners.
+Wide transport cases cover copy-engine row views, uneven distributed broadcasts
+with immediate receiver-buffer reuse, and concurrent owner-pushed expert slots.
+The expert-stream cases run on every available owner and retain records across
+multiple chunks before releasing a ring half. Wide HC local collapse and compact
+BF16 projection tails use independent FP64 oracles, including 2048-column model
+shapes; eager/captured agreement is an additional execution check.
+Reusable QSA block selection is checked against exact score/top-k and independent
+FP64 oracles, including 4096-column chunks deep in the context. Attention with a
+supplied selection is checked against FP64 for each storage, dense/sparse boundary
+and KV-head partition; integrated selection remains covered by width and page-space
+comparisons.
+MTP hidden-projection profiles include four flattened residual streams at 2048
+columns, with BF16/Q8 independent FP64 checks and eager/captured agreement.
+The selectable TP2+PP2 layout also covers both decoder halves' weight ownership,
+INT8 KV and canonical snapshots, and 18-local-layer recurrent replay with partial
+commits into separate destinations. Weighted expert combination uses an independent
+FP64 oracle with poisoned inactive owners, both pipeline owner pairs and overlapping
+input/output storage. CLI, server and Engine option checks cover explicit selection
+and invalid GPU counts; real-model serving checks remain separate from these oracles.
+The smoke runner can run selected checks before loading an explicit real model,
+while restoring the named GPU service after success or failure. Synthetic
+checks do not replace real-model generation, memory-fit or throughput validation.
+
 Run a focused target for a localized change:
 
 ```bash

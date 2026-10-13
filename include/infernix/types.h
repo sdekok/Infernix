@@ -313,6 +313,10 @@ struct EngineOptions {
     std::string thinking_budget_message;
     EnginePurpose purpose              = EnginePurpose::Generation;
     int device                         = 0;
+    // Experimental Qwen4Exp TP+EP; empty keeps the single-GPU route. Primary first.
+    std::vector<int> parallel_devices;
+    bool pipeline_parallel = false;
+    bool fixed_kv_owners = false;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     // Startup-fixed runtime YaRN override, finite [1,4]; 1 preserves native RoPE.
     // Extends only the allowed ceiling, never max_context itself or artifact metadata.

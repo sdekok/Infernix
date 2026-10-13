@@ -2,6 +2,7 @@
 
 #include "artifact/reader.h"
 #include "core/device.h"
+#include "core/parallel_partition.h"
 #include "core/host_memory.h"
 #include "core/startup.h"
 #include "core/vram_budget.h"
@@ -64,6 +65,7 @@ void report(const EngineOptions& options, DiagnosticLevel level, const std::stri
 }
 
 void validate(const EngineOptions& options) {
+    validate_parallel_devices(options.parallel_devices, options.device);
     if (options.purpose != EnginePurpose::Generation) {
         throw std::invalid_argument("Qwen3.8-Flash-Next serves generation only (causal scoring is not wired yet)");
     }
@@ -140,6 +142,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // The SSD tier (design §19.3.7): the banks stay in the artifact; the Program pins RAM slots for
     // the experts the ledger leaves room for (less their lock overhead) and reads the rest on use.
     const bool tier = ledger.placement == models::qwen4_exp::ExpertPlacement::Tier;
+    if (tier && !options.parallel_devices.empty()) {
+        throw std::runtime_error("parallel execution currently requires the complete expert bank in RAM; "
+                                 "the memory ledger selected SSD tiering (" + ledger.describe() + ")");
+    }
     if (tier) {
         auto streamed           = models::load_options(options, models::Architecture::Qwen4Exp);
         streamed.stream_experts = true;
@@ -157,6 +163,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     plan.set_host_reserve(options.ram_headroom_bytes, demand.later_pinned);
 
     models::qwen4_exp::ProgramOptions program_options;
+    program_options.parallel_devices = options.parallel_devices;
+    program_options.pipeline_parallel = options.pipeline_parallel;
+    program_options.fixed_kv_owners = options.fixed_kv_owners;
+    program_options.use_cuda_graph = options.use_cuda_graph;
     program_options.max_context     = options.max_context;
     program_options.max_concurrency = options.max_concurrency;
     program_options.prefill_chunk   = options.prefill_chunk;

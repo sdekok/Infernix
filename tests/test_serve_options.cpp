@@ -31,6 +31,12 @@ ServeOptions parse(std::vector<std::string> arguments) {
 
 int main() {
     int failures       = 0;
+    failures += check(!parse({"infernix-serve", "model.infernix"}).pipeline_parallel, "pipeline must be opt-in");
+    failures += check(!parse({"infernix-serve", "model.infernix"}).fixed_kv_owners, "fixed must be opt-in");
+    const auto pipeline = parse({"infernix-serve", "model.infernix", "--parallel-devices", "0,1,2,3", "--pipeline-parallel"});
+    const auto fixed = parse({"infernix-serve", "model.infernix", "--parallel-devices", "0,1,2,3", "--fixed-kv-owners"});
+    failures += check(pipeline.pipeline_parallel && pipeline.parallel_devices == std::vector<int>{0,1,2,3}, "pipeline selection lost");
+    failures += check(fixed.fixed_kv_owners && fixed.parallel_devices == std::vector<int>{0,1,2,3}, "fixed selection lost");
     failures += check(parse({"infernix-serve", "model.ninfer"}).rope_yarn_factor == 1.0F,
                       "serving YaRN must default off");
     for (const auto* factor : {"1", "2.5", "4"}) {

@@ -126,7 +126,8 @@ void run_repetition(infernix::Engine& engine, const infernix::bench::BenchEnviro
         if (measured) {
             measured->reps.push_back({result.timings, std::move(result.speculative), count,
                                       result.constraint,
-                                      result.engine_timing.constraint_draft_wait_exposed_seconds});
+                                      result.engine_timing.constraint_draft_wait_exposed_seconds,
+                                      std::move(result.generated_token_ids)});
         }
     }
     if (measured) { measured->repetition_wall_seconds.push_back(wall_seconds); }
@@ -185,6 +186,9 @@ int main(int argc, char** argv) {
         infernix::EngineOptions engine_options;
         engine_options.artifact_path   = options.artifact_path;
         engine_options.device          = options.device;
+        engine_options.parallel_devices = options.parallel_devices;
+        engine_options.pipeline_parallel = options.pipeline_parallel;
+        engine_options.fixed_kv_owners = options.fixed_kv_owners;
         engine_options.max_context     = max_context;
         engine_options.max_concurrency = options.concurrency;
         const std::uint64_t kv_capacity =
@@ -250,6 +254,9 @@ int main(int argc, char** argv) {
                   << ", kv_cache=" << infernix::bench::kv_cache_name(options.kv_cache) << ")\n";
         infernix::Engine engine(std::move(engine_options));
         fill_cuda_environment(env, options.device);
+        env.parallel_devices = options.parallel_devices;
+        env.pipeline_parallel = options.pipeline_parallel;
+        env.fixed_kv_owners = options.fixed_kv_owners;
         env.load   = engine.load_summary();
         env.memory = engine.memory_summary();
 

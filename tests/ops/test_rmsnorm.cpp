@@ -124,6 +124,12 @@ int main() {
     int failures = 0;
     failures += run_case("rmsnorm offset [5120,1]", {5120, 1}, true, 1101U);
     failures += run_case("rmsnorm offset [5120,128]", {5120, 128}, true, 1102U);
+    for (int t : {1, 3, 8, 256, 2048}) {
+        for (int heads : {1, 12}) {
+            failures += run_case("Flash-Next owner norm", {256, heads, t}, true,
+                                 2200U + t, 4.f, false, true);
+        }
+    }
     failures += run_case("rmsnorm offset [5120,1024]", {5120, 1024}, true, 1107U);
     failures += run_case("rmsnorm offset [2048,7]", {2048, 7}, true, 1103U);
     failures += run_case("rmsnorm offset [256,24,7]", {256, 24, 7}, true, 1104U);

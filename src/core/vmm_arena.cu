@@ -3,6 +3,7 @@
 #include "core/cuda_vmm.h"
 
 #include <stdexcept>
+#include <algorithm>
 
 namespace infernix {
 
@@ -30,6 +31,12 @@ VmmArena::~VmmArena() {
 
 bool VmmArena::supported(int device) { return vmm::supported(device); }
 
+void VmmArena::allow_access(int device) {
+    if (device == device_ || std::find(access_devices_.begin(), access_devices_.end(), device) != access_devices_.end()) { return; }
+    if (mapped_bytes()) { vmm::set_access(base_, mapped_bytes(), device); }
+    access_devices_.push_back(device);
+}
+
 bool VmmArena::map_chunk() {
     if (mapped_bytes() + chunk_ > reserved_) { return false; }
     const CUmemAllocationProp prop = vmm::device_prop(device_);
@@ -44,6 +51,7 @@ bool VmmArena::map_chunk() {
     }
     try {
         vmm::set_access(va, chunk_, device_);
+        for (int device : access_devices_) { vmm::set_access(va, chunk_, device); }
     } catch (...) {
         (void)cuMemUnmap(va, chunk_);
         (void)cuMemRelease(handle);
@@ -64,6 +72,7 @@ VmmRange::VmmRange(int device, std::size_t reserve_bytes, std::size_t chunk_byte
     if (reserved_ == 0) { throw std::invalid_argument("VMM range: nothing to reserve"); }
     vmm::check(cuMemAddressReserve(&base_, reserved_, chunk_, 0, 0), "cuMemAddressReserve");
     handles_.assign(reserved_ / chunk_, 0);
+    owners_.assign(handles_.size(), -1);
 }
 
 VmmRange::~VmmRange() {
@@ -76,9 +85,19 @@ VmmRange::~VmmRange() {
 }
 
 bool VmmRange::map(std::size_t chunk) {
+    return map(chunk, device_, std::span(&device_, 1));
+}
+
+bool VmmRange::map(std::size_t chunk, int owner, std::span<const int> access_devices) {
     if (chunk >= handles_.size()) { throw std::out_of_range("VMM range: chunk outside the reservation"); }
-    if (handles_[chunk] != 0) { return true; }
-    const CUmemAllocationProp prop = vmm::device_prop(device_);
+    if (handles_[chunk] != 0) {
+        if (owners_[chunk] != owner) { throw std::logic_error("VMM range: cannot change a mapped chunk's owner"); }
+        return true;
+    }
+    if (owner < 0 || chunk_ % vmm::granularity(owner)) {
+        throw std::invalid_argument("VMM range: invalid owner or allocation granularity");
+    }
+    const CUmemAllocationProp prop = vmm::device_prop(owner);
     CUmemGenericAllocationHandle handle{};
     const CUresult created = cuMemCreate(&handle, chunk_, &prop, 0);
     if (created == CUDA_ERROR_OUT_OF_MEMORY) { return false; }
@@ -89,13 +108,17 @@ bool VmmRange::map(std::size_t chunk) {
         vmm::check(mapped, "cuMemMap");
     }
     try {
-        vmm::set_access(va, chunk_, device_);
+        vmm::set_access(va, chunk_, owner);
+        for (const int device : access_devices) {
+            if (device != owner) { vmm::set_access(va, chunk_, device); }
+        }
     } catch (...) {
         (void)cuMemUnmap(va, chunk_);
         (void)cuMemRelease(handle);
         throw;
     }
     handles_[chunk] = handle;
+    owners_[chunk] = owner;
     ++mapped_;
     return true;
 }
@@ -105,7 +128,16 @@ void VmmRange::unmap(std::size_t chunk) {
     vmm::check(cuMemUnmap(base_ + chunk * chunk_, chunk_), "cuMemUnmap");
     vmm::check(cuMemRelease(handles_[chunk]), "cuMemRelease");
     handles_[chunk] = 0;
+    owners_[chunk] = -1;
     --mapped_;
+}
+
+int VmmRange::owner(std::size_t chunk) const { return owners_.at(chunk); }
+
+std::size_t VmmRange::mapped_bytes(int owner) const noexcept {
+    std::size_t bytes = 0;
+    for (int device : owners_) { if (device == owner) { bytes += chunk_; } }
+    return bytes;
 }
 
 void VmmArena::unmap_chunk() {

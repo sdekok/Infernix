@@ -3,6 +3,9 @@
 /third_party/spdlog/include/** -whitespace
 /third_party/spdlog/src/** -whitespace
 
+# Archived experiment diffs require their leading context spaces, including blank lines.
+/tools/tp4/experiments/*.patch eol=lf -whitespace
+
 # Chat template fixtures are acceptance-digested byte-exact content.
 /tests/fixtures/frontend/reasoning_effort_froggeric_v225_chat_template.jinja eol=lf
 

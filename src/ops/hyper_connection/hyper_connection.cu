@@ -135,7 +135,7 @@ __global__ void expand_kernel(const bf16* __restrict__ x, int hidden, int stream
 }
 
 // The composed route's steps (private since hyper_connection_mix).
-void hyper_connection_norm(const Tensor& residual, const Tensor& weight, std::int32_t streams,
+void norm_composed(const Tensor& residual, const Tensor& weight, std::int32_t streams,
                            float eps, Tensor& out, cudaStream_t stream) {
     require(streams > 0 && contiguous_2d(residual, DType::BF16) && contiguous_2d(out, DType::BF16) &&
                 contiguous_2d(weight, DType::BF16),
@@ -152,7 +152,7 @@ void hyper_connection_norm(const Tensor& residual, const Tensor& weight, std::in
     check_launch("norm");
 }
 
-void hyper_connection_gates(const Tensor& z, std::int32_t rank, std::int32_t streams, Tensor& mix,
+void gates_composed(const Tensor& z, std::int32_t rank, std::int32_t streams, Tensor& mix,
                             Tensor* inject, cudaStream_t stream) {
     require(contiguous_2d(z, DType::BF16) && contiguous_2d(mix, DType::BF16) && rank > 0 && streams > 0,
             "gates require contiguous BF16 tensors");
@@ -171,7 +171,7 @@ void hyper_connection_gates(const Tensor& z, std::int32_t rank, std::int32_t str
     check_launch("gates");
 }
 
-void hyper_connection_collapse(const Tensor& mix_logits, const Tensor& normalized,
+void collapse_composed(const Tensor& mix_logits, const Tensor& normalized,
                                std::int32_t streams, Tensor& out, cudaStream_t stream) {
     require(contiguous_2d(mix_logits, DType::BF16) && contiguous_2d(normalized, DType::BF16) &&
                 contiguous_2d(out, DType::BF16) && streams > 0,
@@ -201,6 +201,16 @@ std::size_t composed_bytes(const Weight& down, const Weight& up, LinearPolicy po
 }
 
 } // namespace
+
+void hyper_connection_norm(const Tensor& r, const Tensor& w, int s, float e, Tensor& out, cudaStream_t stream) {
+    norm_composed(r, w, s, e, out, stream);
+}
+void hyper_connection_gates(const Tensor& z, int r, int s, Tensor& m, Tensor* i, cudaStream_t stream) {
+    gates_composed(z, r, s, m, i, stream);
+}
+void hyper_connection_collapse(const Tensor& u, const Tensor& n, int s, Tensor& out, cudaStream_t stream) {
+    collapse_composed(u, n, s, out, stream);
+}
 
 void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, const Weight& down,
                           const Weight& up, LinearPolicy policy, std::int32_t streams,

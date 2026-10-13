@@ -9,6 +9,7 @@
 #include <cuda.h>
 
 #include <cstddef>
+#include <span>
 #include <vector>
 
 namespace infernix {
@@ -30,6 +31,10 @@ public:
     [[nodiscard]] std::size_t reserved_bytes() const noexcept { return reserved_; }
     [[nodiscard]] std::size_t mapped_bytes() const noexcept { return chunks_.size() * chunk_; }
 
+    // Grant a peer access to existing and future chunks. Used when frame
+    // lending places shared activations in an otherwise owner-local cache.
+    void allow_access(int device);
+
     // Maps one more chunk at the top; false (nothing mapped) when the device has no memory for it.
     [[nodiscard]] bool map_chunk();
     // Releases the top chunk; the caller has finished every device access to it.
@@ -41,6 +46,7 @@ private:
     std::size_t reserved_  = 0;
     CUdeviceptr base_      = 0;
     std::vector<CUmemGenericAllocationHandle> chunks_;
+    std::vector<int> access_devices_;
 };
 
 // A reserved virtual range whose chunks are mapped individually, anywhere in it (an elastic pool
@@ -62,6 +68,11 @@ public:
 
     // Maps chunk `chunk`; false (nothing mapped) when the device has no memory for it.
     [[nodiscard]] bool map(std::size_t chunk);
+    // One physical owner, explicitly accessible by the supplied peer devices.
+    // Remapping an existing chunk to a different owner is rejected.
+    [[nodiscard]] bool map(std::size_t chunk, int owner, std::span<const int> access_devices);
+    [[nodiscard]] int owner(std::size_t chunk) const;
+    [[nodiscard]] std::size_t mapped_bytes(int owner) const noexcept;
     // Releases chunk `chunk`; the caller has finished every device access to it.
     void unmap(std::size_t chunk);
 
@@ -72,6 +83,7 @@ private:
     std::size_t mapped_   = 0;
     CUdeviceptr base_     = 0;
     std::vector<CUmemGenericAllocationHandle> handles_; // 0: unmapped
+    std::vector<int> owners_; // -1: unmapped
 };
 
 } // namespace infernix

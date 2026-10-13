@@ -128,7 +128,8 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
     };
     if (cpu_service_) { cpu_service_->wake(); }
     residency_->before_round(s);
-    expert_stream_->begin(ring_span(), residency_->host_table(), s);
+    expert_stream_->begin(ring_span(), residency_->host_table(), s, false, 0, options_.pipeline_parallel ? c_.num_hidden_layers / 2 : c_.num_hidden_layers);
+    if (parallel_) { parallel_->begin_prefill_stream(); }
     for (std::size_t c = 0; c < n; ++c) {
         const std::int32_t b = walk_.begins[c], w = walk_.widths[c];
         // Rows the previous span prefetched already stand at this chunk's slot.
@@ -172,9 +173,14 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
         }
         // The chunk's embedding and first layer run while the host stages the next chunk.
         const WideWork wide(*this, w);
-        walk_pass(c, 0);
+        if (options_.pipeline_parallel) {
+            auto fb = io_batch(slot, 1, w, 1); fb.host_slots = std::span<const std::int32_t>(&walk_.host_slot, 1); fb.host_table_rows = fb.host_slots;
+            fb.vision = walk_.vision[c] ? &*walk_.vision[c] : nullptr;
+            Tensor residual(area + 2ULL * width_ * walk_.offsets[c], DType::BF16, {width_, w});
+            forward_->begin_call(fb, nullptr); forward_->embed(fb, residual);
+        } else { walk_pass(c, 0); }
     }
-    walk_.next_layer = 1;
+    walk_.next_layer = options_.pipeline_parallel ? 0 : 1;
     walk_prefetch_   = WalkPrefetch{}; // consumed; the slots now hold this span's chunks
     ++walk_spans_;
     walk_calls_ += n;
@@ -262,22 +268,22 @@ void ProgramImpl::walk_pass(std::size_t c, std::uint32_t l) {
         fb.layer_waits[1] = prefix_->staged_events(walk_.taps[c - 1].staged);
     }
     fb.stream         = true;
-    fb.release_stream = c + 1 == n;
+    fb.release_stream = c + 1 == (pipeline_group_end_ == SIZE_MAX ? n : pipeline_group_end_);
     Tensor residual(area + 2ULL * static_cast<std::size_t>(width_) * static_cast<std::size_t>(walk_.offsets[c]),
                     DType::BF16, {width_, w});
-    const bool logits_here = l + 1 == L && prompt_end && c + 1 == n;
+    const bool logits_here = (l == L || (!pipeline_defer_finish_ && l + 1 == L)) && prompt_end && c + 1 == n;
     Tensor logits(logits32_.p, DType::FP32, {vocab_, 1});
     forward_->begin_call(fb, logits_here ? &logits : nullptr);
-    if (l == 0) { forward_->embed(fb, residual); }
-    forward_->layer(l, fb, residual);
-    if (l + 1 == L) { forward_->finish(fb, residual, logits_here ? &logits : nullptr); }
+    if (l == 0 && !(options_.pipeline_parallel)) { forward_->embed(fb, residual); }
+    if (l < L) { forward_->layer(l, fb, residual); }
+    if (l == L || (!pipeline_defer_finish_ && l + 1 == L)) { forward_->finish(fb, residual, logits_here ? &logits : nullptr); }
     if (const LayerWalk::Tap& tap = walk_.taps[c]; tap.staged != 0) {
         // The chunk's end in this layer (and after the last layer, in the MTP block): copy it out.
         const Lane& lane = lanes_[walk_.lane];
         std::optional<DeviceKVPageHandle> tail_page;
         if (tap.frontier % kBlock != 0) { tail_page = lane.pages.at(tap.frontier / kBlock - lane.prefix.page_base).handle(); }
-        prefix_->capture_group(tap.staged, l, walk_.lane, tail_page, device_.stream);
-        if (l + 1 == L) { prefix_->capture_group(tap.staged, L, walk_.lane, tail_page, device_.stream); }
+        if (l < L) { prefix_->capture_group(tap.staged, l, walk_.lane, tail_page, device_.stream); }
+        if (l == L || (!pipeline_defer_finish_ && l + 1 == L)) { prefix_->capture_group(tap.staged, L, walk_.lane, tail_page, device_.stream); }
     }
 }
 
@@ -318,8 +324,87 @@ void ProgramImpl::walk_commit_taps(Lane& lane) {
     }
 }
 
+void ProgramImpl::walk_pipeline() {
+    const std::size_t n = walk_.widths.size(), group = std::min<std::size_t>(8, std::max<std::size_t>(1, n / 2));
+    const std::uint32_t half = c_.num_hidden_layers / 2, L = c_.num_hidden_layers;
+    const std::size_t budget = std::max<std::size_t>(1, walk_.layers_per_step * n);
+    std::size_t submitted = 0;
+    pipeline_defer_finish_ = true;
+    bool auxiliary = false;
+    try {
+        while (submitted < budget) {
+            const auto begin = walk_.pipeline_begin;
+            if (!walk_.pipeline_draining) {
+                const auto end = std::min(n, begin + group);
+                if (walk_.pipeline_layer == 0 && begin) {
+                    if (begin > group) { parallel_->restart_pipeline_stream(1); }
+                    pipeline_switch(); auxiliary = true;
+                    CUDA_CHECK(cudaStreamWaitEvent(device_.stream, pipeline_ready_, 0));
+                    pipeline_switch(); auxiliary = false;
+                    expert_stream_->end();
+                    expert_stream_->begin(ring_span(), residency_->host_table(), device_.stream, false, 0, half);
+                    parallel_->restart_pipeline_stream(0);
+                }
+                const auto l = walk_.pipeline_layer;
+                const auto count = begin ? group : end - begin;
+                for (std::size_t offset = 0; offset < count; ++offset) {
+                    if (begin) {
+                        pipeline_switch(); auxiliary = true;
+                        pipeline_group_end_ = begin;
+                        walk_pass(begin - group + offset, half + l);
+                        pipeline_switch(); auxiliary = false;
+                        ++submitted; ++walk_.pipeline_calls;
+                    }
+                    if (begin + offset < end) {
+                        pipeline_group_end_ = end;
+                        walk_pass(begin + offset, l);
+                        ++submitted; ++walk_.pipeline_calls;
+                    }
+                }
+                if (++walk_.pipeline_layer == half) {
+                    CUDA_CHECK(cudaEventRecord(pipeline_ready_, device_.stream));
+                    walk_.pipeline_layer = 0;
+                    if (end == n) { walk_.pipeline_draining = true; }
+                    else { walk_.pipeline_begin += group; }
+                }
+            } else {
+                if (walk_.pipeline_layer == 0 && begin) { parallel_->restart_pipeline_stream(1); }
+                pipeline_switch(); auxiliary = true;
+                if (walk_.pipeline_layer == 0) { CUDA_CHECK(cudaStreamWaitEvent(device_.stream, pipeline_ready_, 0)); }
+                pipeline_group_end_ = n;
+                for (std::size_t c = begin; c < n; ++c) { walk_pass(c, half + walk_.pipeline_layer); ++submitted; ++walk_.pipeline_calls; }
+                pipeline_switch(); auxiliary = false;
+                if (++walk_.pipeline_layer == half) {
+                    pipeline_switch(); auxiliary = true;
+                    CUDA_CHECK(cudaEventRecord(pipeline_done_, device_.stream));
+                    pipeline_switch(); auxiliary = false;
+                    CUDA_CHECK(cudaStreamWaitEvent(device_.stream, pipeline_done_, 0));
+                    pipeline_defer_finish_ = false; pipeline_group_end_ = SIZE_MAX;
+                    for (std::size_t c = 0; c < n; ++c) { walk_pass(c, L); }
+                    walk_.next_layer = L;
+                    return;
+                }
+            }
+        }
+        // Join both stages at the ordinary Engine step boundary. Other lanes
+        // and cancellation may run before the next bounded submission.
+        pipeline_switch(); auxiliary = true;
+        CUDA_CHECK(cudaEventRecord(pipeline_done_, device_.stream));
+        pipeline_switch(); auxiliary = false;
+        CUDA_CHECK(cudaStreamWaitEvent(device_.stream, pipeline_done_, 0));
+        walk_.next_layer = std::min<std::uint32_t>(L - 1, walk_.pipeline_calls / n);
+        pipeline_defer_finish_ = false; pipeline_group_end_ = SIZE_MAX;
+    } catch (...) {
+        if (auxiliary) { pipeline_switch(); }
+        try { parallel_->synchronize_pipeline(); } catch (...) {}
+        pipeline_defer_finish_ = false; pipeline_group_end_ = SIZE_MAX;
+        throw;
+    }
+}
+
 void ProgramImpl::walk_enqueue(std::uint32_t to_layer) {
     require_tier_round();
+    if (options_.pipeline_parallel) { walk_pipeline(); return; }
     for (std::uint32_t l = walk_.next_layer; l < to_layer; ++l) {
         for (std::size_t c = 0; c < walk_.widths.size(); ++c) { walk_pass(c, l); }
     }
@@ -332,7 +417,7 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
     for (const auto w : walk_.widths) { tokens += static_cast<std::uint32_t>(w); }
     // The first step already ran layer 0 while staging.
     const std::uint32_t to =
-        std::min(L, walk_.next_layer + walk_.layers_per_step - (walk_.steps == 0 ? 1U : 0U));
+        options_.pipeline_parallel ? L : std::min(L, walk_.next_layer + walk_.layers_per_step - (walk_.steps == 0 ? 1U : 0U));
     if (walk_.steps > 0) {
         // A step boundary, before the step's calls: a decode or verification round of another lane
         // since the last step closed the tier's round when it settled, and the tier answers fetch
@@ -348,11 +433,11 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
         walk_enqueue(to);
     }
     ++walk_.steps;
-    if (to < L) {
+    if (walk_.next_layer < L) {
         // While the device runs this step, read the next span's n-gram rows (one span's chunks spread
         // over the remaining steps; ~35-70 ms of NVMe reads per 4,096-token chunk).
         if (walk_.steps > 1 && walk_.end_call < lane.calls.size()) {
-            const std::size_t remaining = (L - to + walk_.layers_per_step - 1) / walk_.layers_per_step + 1;
+            const std::size_t remaining = (L - walk_.next_layer + walk_.layers_per_step - 1) / walk_.layers_per_step + 1;
             const std::size_t slots     = walk_host_.size() / walk_.io_stride;
             const std::size_t have      = walk_prefetch_.valid ? walk_prefetch_.widths.size() : 0;
             walk_prefetch_rows(lane, index, slots > have ? (slots - have + remaining - 1) / remaining : 0);
@@ -377,6 +462,7 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
     lane.next_call    = walk_.end_call;
     residency_->enqueue_route_download(device_.stream, width);
     expert_stream_->end();
+    if (parallel_) { parallel_->end_prefill_stream(); }
     walk_.active   = false;
     host_lanes_[0] = static_cast<std::int32_t>(index);
     if (last && !prefilling_besides(index)) {
@@ -411,9 +497,13 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
 void ProgramImpl::walk_abandon() noexcept {
     if (!walk_.active) { return; }
     try {
+        if (parallel_) { parallel_->synchronize_pipeline(); }
         device_.synchronize();
     } catch (...) {}
     expert_stream_->end();
+    try {
+        if (parallel_) { parallel_->end_prefill_stream(); }
+    } catch (...) {}
     for (const LayerWalk::Tap& tap : walk_.taps) {
         if (tap.staged != 0) { prefix_->abandon_staged_capture(tap.staged); }
     }

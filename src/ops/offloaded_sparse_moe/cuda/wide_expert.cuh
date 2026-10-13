@@ -1,4 +1,5 @@
 #pragma once
+#include "core/cuda_function_attributes.h"
 
 // The wide-route grouped GEMM of offloaded_sparse_moe (wide_expert.h). It is the warp-specialized
 // TMA pipeline of the dense NVFP4 W4A4 route (ops/linear/nvfp4/nvfp4_a4_tma.cuh) made grouped and
@@ -412,13 +413,8 @@ void launch(const Call& call, std::int32_t pass, const Epilogue& epilogue, cudaS
     constexpr int bytes = static_cast<int>(sizeof(Storage<S>));
     // Static: MSVC 2022 rejects the lambda's use of an automatic constexpr local (C2326).
     static constexpr auto kernel = grouped_kernel<M, Epilogue>;
-    static const bool configured = [] {
-        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
-                                        cudaSharedmemCarveoutMaxShared));
-        return true;
-    }();
-    (void)configured;
-    const int dynamic = detail::nvfp4_prepare_shared<bytes, kernel, true>();
+    prepare_cuda_shared<kernel>(bytes, true);
+    const int dynamic = bytes;
 #ifdef _WIN32
     kernel<<<persistent_ctas(), S::kThreads, dynamic, stream>>>(static_cast<const Descriptors*>(call.descriptors),
                                                                  call, pass, epilogue);

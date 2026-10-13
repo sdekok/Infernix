@@ -1,4 +1,5 @@
 #pragma once
+#include "core/cuda_function_attributes.h"
 
 // The wide route of W4A16 experts (wide_expert.h, design §16.2.1): the grouped, persistent,
 // warp-specialized pipeline of wide_expert.cuh on integer tensor cores, with the narrow route's
@@ -324,13 +325,7 @@ void launch_a16(const Call& call, std::int32_t pass, const Epilogue& epilogue, c
     constexpr int bytes = static_cast<int>(sizeof(StorageA16));
     // Static: MSVC 2022 rejects the lambda's use of an automatic constexpr local (C2326).
     static constexpr auto kernel = grouped_kernel_a16<M, Epilogue>;
-    static const bool configured = [] {
-        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
-        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
-                                        cudaSharedmemCarveoutMaxShared));
-        return true;
-    }();
-    (void)configured;
+    prepare_cuda_shared<kernel>(bytes, true);
     // One resident wave of this schedule's CTAs (persistent_ctas() counts the A4 schedule's).
     const int ctas = persistent_ctas() / Schedule::kMinBlocksPerSm * S::kMinBlocksPerSm;
     kernel<<<ctas, S::kThreads, bytes, stream>>>(call, pass, epilogue);

@@ -498,6 +498,15 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
         .storage      = storage,
     };
 
+    auto row = to_device_i32({0});
+    const auto append = [&] {
+        if (kv_heads != 1) { ops::kv_cache_append(k, v, position_tensor, cache, nullptr); return; }
+        PagedKVBatchLayerView batch_cache{.k_pages = cache.k_pages, .v_pages = cache.v_pages,
+            .k_scale_pages = cache.k_scale_pages, .v_scale_pages = cache.v_scale_pages,
+            .block_tables = cache.block_table.view({logical_pages, 1}), .head_dim = kFullHeadDim,
+            .num_kv_heads = 1, .storage = storage};
+        ops::kv_cache_append_batch(k, v, position_tensor.view({tokens, 1}), Tensor(row.p, DType::I32, {1}), batch_cache, nullptr);
+    };
     int failures = 0;
     if (storage == KvCacheStorage::BFloat16) {
         auto expected_k = patterned_bits(k_code_count, 0xabcdef01u);
@@ -517,7 +526,7 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
                 }
             }
         }
-        ops::kv_cache_append(k, v, position_tensor, cache, nullptr);
+        append();
         cuda_synchronize();
         const std::string label = "kv_cache_append full bf16 Hkv=" + std::to_string(kv_heads) +
                                   " T=" + std::to_string(tokens) +
@@ -554,7 +563,7 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
                 }
             }
         }
-        ops::kv_cache_append(k, v, position_tensor, cache, nullptr);
+        append();
         cuda_synchronize();
         const std::string label = "kv_cache_append full int8-g64 Hkv=" + std::to_string(kv_heads) +
                                   " T=" + std::to_string(tokens) +
@@ -600,7 +609,7 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
                                     expected_scale_v);
             }
         }
-        ops::kv_cache_append(k, v, position_tensor, cache, nullptr);
+        append();
         cuda_synchronize();
         const std::string label =
             "kv_cache_append full fp8-row256 Hkv=" + std::to_string(kv_heads) +
@@ -652,7 +661,7 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
                                       expected_scale_v);
             }
         }
-        ops::kv_cache_append(k, v, position_tensor, cache, nullptr);
+        append();
         cuda_synchronize();
         const std::string label = "kv_cache_append full k8v4 Hkv=" + std::to_string(kv_heads) +
                                   " T=" + std::to_string(tokens) +
@@ -703,7 +712,7 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
                                       expected_scale_v);
             }
         }
-        ops::kv_cache_append(k, v, position_tensor, cache, nullptr);
+        append();
         cuda_synchronize();
         const std::string label = "kv_cache_append full nvfp4-g16 Hkv=" + std::to_string(kv_heads) +
                                   " T=" + std::to_string(tokens) +
@@ -1408,7 +1417,7 @@ int main(int argc, char** argv) {
     if (nvfp4_only || k8v4_only) {
         const KvCacheStorage storage =
             nvfp4_only ? KvCacheStorage::Nvfp4Group16 : KvCacheStorage::Fp8KeyNvfp4Value;
-        for (const int kv_heads : {4, 2}) { failures += full_append_case(kv_heads, storage); }
+        for (const int kv_heads : {4, 2, 1}) { failures += full_append_case(kv_heads, storage); }
         failures += full_append_case(2, storage, 129);
         if (failures != 0) {
             std::cerr << (nvfp4_only ? "nvfp4" : "k8v4") << " kv_cache_append failures=" << failures
@@ -1419,7 +1428,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    for (const int kv_heads : {4, 2}) {
+    for (const int kv_heads : {4, 2, 1}) {
         failures += full_append_case(kv_heads, KvCacheStorage::BFloat16);
         failures += full_append_case(kv_heads, KvCacheStorage::Int8Group64);
         failures += full_append_case(kv_heads, KvCacheStorage::Fp8E4M3Row256);
@@ -1430,6 +1439,10 @@ int main(int argc, char** argv) {
     failures += full_append_case(2, KvCacheStorage::Fp8E4M3Row256, 129);
     failures += full_append_case(2, KvCacheStorage::Nvfp4Group16, 129);
     failures += full_append_case(2, KvCacheStorage::Fp8KeyNvfp4Value, 129);
+    for (auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+                         KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+        failures += full_append_case(1, storage, 129);
+    }
     failures += run_case(1, 0, 0, false, {0, 1, 2});
     failures += run_case(1, 1, 63, false, {2, 3, 4});
     failures += run_case(16, 7, 60, false, {5, 1, 4}, 5);

@@ -1,0 +1,498 @@
+--- a/src/models/qwen4_exp/execution/parallel.cpp
++++ b/src/models/qwen4_exp/execution/parallel.cpp
+@@ -568,7 +568,6 @@
+     auto& p = *impl_; RestoreDevice restore{p.primary.device};
+     const auto& config = p.parameters.model.config().text;
+     const int T = x.ne[1], DK = config.gdn.key_head_dim, DV = config.gdn.value_head_dim;
+-    const int VW = config.gdn.value_width();
+     p.start(&x);
+     for (int i = 0; i < size(); ++i) {
+         auto& r = *p.ranks[i]; r.device->bind_to_current_thread();
+@@ -636,37 +635,29 @@
+             config.rms_norm_eps, normed, r.device->execution_view());
+         p.done(i);
+     }
+-    // Every row owner needs the complete recurrent output for its local dense
+-    // dot products. Pull the disjoint pieces directly from their owners.
+     Tensor output = primary_work.alloc(DType::BF16, {int(config.hidden_size), T});
++    std::array<Tensor, 4> partials;
+     for (int i = 0; i < size(); ++i) {
+         auto& r = *p.ranks[i]; r.device->bind_to_current_thread();
+-        Tensor input(r.input.p, DType::BF16, {VW, T});
+-        for (int owner = 0; owner < size(); ++owner) {
+-            if (owner != i) { CUDA_CHECK(cudaStreamWaitEvent(r.device->stream, p.ranks[owner]->done, 0)); }
+-            const auto head = states.shards[owner].heads.values;
+-            Tensor local(p.ranks[owner]->gdn_output.data, DType::BF16, {head.count * DV, T});
+-            gather_peer_rows(local, input, head.begin * DV, r.device->stream);
+-        }
+-        const auto& weight = g.output.parallel->shards[i].weight;
+-        Tensor local(r.output.p, DType::BF16, {weight.n, T});
++        const auto& shard = g.output.parallel->shards[i];
++        Tensor input = r.gdn_output.view({shard.weight.k, T});
++        partials[i] = Tensor(r.output.p, DType::FP32, {shard.weight.n, T});
+         r.workspace->reset();
+-        parallel_projection(input, weight, local, g.output.policy, *r.workspace, r.device->stream);
+-        // Keep readiness of recurrent pieces distinct from projection completion:
+-        // later receivers must not accidentally wait for an already re-recorded event.
++        parallel_projection(input, shard.weight, partials[i], g.output.policy, *r.workspace, r.device->stream, ops::ProjectionOrder::Throughput);
+         CUDA_CHECK(cudaEventRecord(r.gdn_projected, r.device->stream));
+     }
+     p.primary.bind_to_current_thread();
+-    for (int i = 0; i < size(); ++i) {
+-        if (i) { CUDA_CHECK(cudaStreamWaitEvent(p.primary.stream, p.ranks[i]->gdn_projected, 0)); }
+-        const auto& shard = g.output.parallel->shards[i];
+-        Tensor local(p.ranks[i]->output.p, DType::BF16, {shard.weight.n, T});
+-        int first = 0;
+-        for (const auto segment : shard.segments) {
+-            Tensor part = local.slice(0, first, segment.count);
+-            gather_peer_rows(part, output, segment.begin, p.primary.stream); first += segment.count;
++    for (int i = 1; i < size(); ++i) {
++        CUDA_CHECK(cudaStreamWaitEvent(p.primary.stream, p.ranks[i]->gdn_projected, 0));
++        if (T > 8) {
++            // Wide reductions use local FP32 arrays after copy-engine transport.
++            // Narrow decode avoids the extra launch and scratch traffic.
++            Tensor local = p.ranks[0]->state_work->alloc(DType::FP32, {partials[i].ne[0], T});
++            copy_peer_bytes(local.data, partials[i].data, local.bytes(), p.primary.stream);
++            partials[i] = local;
+         }
+     }
++    ops::projection_sum(std::span(partials).first(size()), output, p.primary.stream);
+     return output;
+ }
+ 
+--- a/src/models/qwen4_exp/parallel_weights.cpp
++++ b/src/models/qwen4_exp/parallel_weights.cpp
+@@ -69,6 +69,56 @@
+                 CUDA_CHECK(cudaSetDevice(devices[rank]));
+                 ParallelWeightShard shard;
+                 shard.device = devices[rank];
++                if (plan.kind == WeightPartition::InputColumns) {
++                    if (plan.rank_columns.size() != devices.size() || !plan.rank_rows.empty()) {
++                        throw std::invalid_argument("input-column partition needs one interval per rank");
++                    }
++                    int end = 0;
++                    for (const auto part : plan.rank_columns) {
++                        if (part.begin != end || part.count <= 0 || part.begin % 128 || part.count % 128) {
++                            throw std::invalid_argument("input-column shards must cover whole aligned groups once");
++                        }
++                        end += part.count;
++                    }
++                    if (end != weight.logical.k) { throw std::invalid_argument("incomplete input-column partition"); }
++                    const auto part = plan.rank_columns[rank];
++                    shard.units = part; shard.segments = {{0, weight.logical.n}};
++                    auto local_geometry = g;
++                    local_geometry.shape[1] = local_geometry.padded_columns = part.count;
++                    const int code_factor = g.format == QType::BF16 ? 2 : 1;
++                    const int code_divisor = g.format == QType::Q4_G64_FP16 ? 2 : 1;
++                    const std::size_t local_code = std::size_t(part.count) * code_factor / code_divisor;
++                    const std::size_t local_scale = g.scale_bytes_per_row ? std::size_t(part.count) / g.group_size * 2 : 0;
++                    local_geometry.code_bytes_per_row = local_code;
++                    local_geometry.scale_bytes_per_row = local_scale;
++                    shard.weight = parallel_weight_metadata(local_geometry, weight.logical.n);
++                    shard.codes = DeviceBuffer(std::size_t(weight.logical.n) * local_code);
++                    if (local_scale) { shard.scales = DeviceBuffer(std::size_t(weight.logical.n) * local_scale); }
++                    // Bounded row batches keep file reads and device uploads coarse;
++                    // bytes/groups are copied verbatim, never dequantized/requantized.
++                    std::vector<std::byte> packed(staging.size());
++                    const auto columns = [&](DeviceBuffer& dst, std::uint64_t plane_offset,
++                                             std::size_t source_row, std::size_t first_byte, std::size_t bytes) {
++                        const auto per_batch = std::max<std::size_t>(1, staging.size() / source_row);
++                        for (std::size_t row = 0; row < std::size_t(weight.logical.n);) {
++                            const auto count = std::min<std::size_t>(per_batch, weight.logical.n - row);
++                            reader.read_into(file_base + plane_offset + row * source_row,
++                                             std::span(staging).first(count * source_row));
++                            for (std::size_t i = 0; i < count; ++i) {
++                                std::copy_n(staging.data() + i * source_row + first_byte, bytes, packed.data() + i * bytes);
++                            }
++                            dst.copy_from_host(packed.data(), count * bytes, row * bytes); row += count;
++                        }
++                    };
++                    columns(shard.codes, 0, code_row, std::size_t(part.begin) * code_factor / code_divisor, local_code);
++                    if (local_scale) { columns(shard.scales, g.scale_offset, g.scale_bytes_per_row,
++                                               std::size_t(part.begin) / g.group_size * 2, local_scale); }
++                    shard.weight.payload = shard.weight.qdata = shard.codes.p;
++                    shard.weight.scales = shard.scales.p;
++                    shard.weight.payload_bytes = shard.codes.bytes + shard.scales.bytes;
++                    weight.shards.push_back(std::move(shard));
++                    continue;
++                }
+                 shard.segments = parallel_weight_segments(weight.logical.n, plan,
+                                                             static_cast<int>(rank), static_cast<int>(devices.size()));
+                 if (shard.segments.empty()) {
+--- a/src/models/qwen4_exp/parallel_weights.h
++++ b/src/models/qwen4_exp/parallel_weights.h
+@@ -9,7 +9,7 @@
+ namespace infernix::models::qwen4_exp {
+ // A segment retains encoded rows verbatim. Paired gate/up and HC stream rows
+ // are assigned together, so their fused kernels can operate on local weights.
+-enum class WeightPartition { Rows, Paired, StreamFeatures, Experts };
++enum class WeightPartition { Rows, Paired, StreamFeatures, Experts, InputColumns };
+ struct ParallelWeightPlan {
+     artifact::ObjectHandle object;
+     WeightPartition kind = WeightPartition::Rows;
+@@ -17,6 +17,8 @@
+     // Model-selected semantic head rows. Empty means the regular partition above.
+     // An individual rank may own no rows of a two-owner attention projection.
+     std::vector<std::vector<RowPartition>> rank_rows;
++    // Input-feature partitions retain whole encoded quantization groups.
++    std::vector<RowPartition> rank_columns;
+ };
+ struct ParallelWeightShard {
+     int device = 0;
+--- a/src/models/qwen4_exp/load.cpp
++++ b/src/models/qwen4_exp/load.cpp
+@@ -530,6 +530,14 @@
+                 attention(*a, c.compact_layer_indices[layer]);
+             } else {
+                 const auto& g = std::get<GdnWeights>(mixer);
++                const auto output_object = out->pending.at(g.output.index).reference.binding.parts.front().object;
++                auto& output_plan = partitions.at(output_object.index);
++                output_plan.kind = WeightPartition::InputColumns;
++                for (int owner = 0; owner < ranks; ++owner) {
++                    const auto heads = gdn_head_partition(c.gdn.key_heads, c.gdn.value_heads, owner, ranks).values;
++                    output_plan.rank_columns.push_back({heads.begin * int(c.gdn.value_head_dim),
++                                                       heads.count * int(c.gdn.value_head_dim)});
++                }
+                 for (int owner = 0; owner < ranks; ++owner) {
+                     const auto p = gdn_head_partition(c.gdn.key_heads, c.gdn.value_heads, owner, ranks);
+                     const RowPartition k{p.keys.begin * int(c.gdn.key_head_dim), p.keys.count * int(c.gdn.key_head_dim)};
+@@ -549,6 +557,14 @@
+         for (const auto& [index, p] : partitions) {
+             const auto& g = reader.geometry(p.object);
+             (void)parallel_weight_metadata(g, static_cast<int>(g.shape[0]));
++            if (p.kind == WeightPartition::InputColumns) {
++                const auto columns = p.rank_columns.front().count;
++                const auto code_bytes = g.format == QType::BF16 ? columns * 2 :
++                    g.format == QType::Q4_G64_FP16 ? columns / 2 : columns;
++                const auto scale_bytes = g.scale_bytes_per_row ? columns / g.group_size * 2 : 0;
++                out->primary_shard_bytes += g.shape[0] * (code_bytes + scale_bytes);
++                out->parallel.push_back(p); continue;
++            }
+             const auto segments = parallel_weight_segments(static_cast<int>(g.shape[0]), p,
+                                                             0, static_cast<int>(options.parallel_devices.size()));
+             const auto row_bytes = g.layout == QuantLayout::Contiguous ? g.shape[1] * 2
+--- a/tests/test_parallel_weights.cpp
++++ b/tests/test_parallel_weights.cpp
+@@ -108,13 +108,19 @@
+         world.devices[0]->bind_to_current_thread();
+         backing = artifact::materialize(*reader, std::move(binder).finish(), *world.devices[0]);
+         const auto object = reader->find("matrix");
+-        const q::ParallelWeightPlan plan{object, kind, groups, std::move(rank_rows)};
++        q::ParallelWeightPlan plan{object, kind, groups, std::move(rank_rows)};
++        if (kind == q::WeightPartition::InputColumns) {
++            for (int rank = 0; rank < int(world.ids.size()); ++rank) {
++                const auto h = q::gdn_head_partition(16, 48, rank, world.ids.size()).values;
++                plan.rank_columns.push_back({h.begin * 128, h.count * 128});
++            }
++        }
+         storage = std::make_unique<q::ParallelWeightStorage>(*reader, backing, std::span(&plan, 1), world.ids, 0);
+         weight = storage->find(&backing.streamed_parent(object));
+         require(weight && weight->logical.qdata == nullptr && !backing.has_device(object), "full dense matrix was retained");
+         const auto& geometry = reader->geometry(object);
+         const std::size_t row_bytes = host.weight.qtype == QType::BF16 ? host.weight.k * 2 : geometry.code_bytes_per_row;
+-        std::vector<int> coverage(host.weight.n);
++        std::vector<int> coverage(kind == q::WeightPartition::InputColumns ? host.weight.k : host.weight.n);
+         std::uint64_t allocated = 0;
+         for (const auto& shard : weight->shards) {
+             if (!shard.weight.n) {
+@@ -127,6 +133,25 @@
+             std::vector<std::uint8_t> codes(shard.codes.bytes), scales(shard.scales.bytes);
+             shard.codes.copy_to_host(codes.data(), codes.size());
+             if (!scales.empty()) { shard.scales.copy_to_host(scales.data(), scales.size()); }
++            if (kind == q::WeightPartition::InputColumns) {
++                const auto part = shard.units;
++                for (int k = part.begin; k < part.begin + part.count; ++k) { ++coverage[k]; }
++                const auto factor = host.weight.qtype == QType::BF16 ? 2 : 1;
++                const auto divisor = host.weight.qtype == QType::Q4_G64_FP16 ? 2 : 1;
++                const auto code_bytes = part.count * factor / divisor;
++                const auto scale_bytes = scales.empty() ? 0 : part.count / geometry.group_size * 2;
++                for (int row = 0; row < host.weight.n; ++row) {
++                    require(std::memcmp(codes.data() + row * code_bytes,
++                        host.payload.data() + row * row_bytes + part.begin * factor / divisor,
++                        code_bytes) == 0, "column codes differ from artifact");
++                    if (scale_bytes) {
++                        require(std::memcmp(scales.data() + row * scale_bytes,
++                            host.payload.data() + geometry.scale_offset + row * geometry.scale_bytes_per_row + part.begin / geometry.group_size * 2,
++                            scale_bytes) == 0, "column scales differ from artifact");
++                    }
++                }
++                allocated += storage->bytes(shard.device); continue;
++            }
+             std::size_t local = 0;
+             for (const auto segment : shard.segments) for (int r = 0; r < segment.count; ++r, ++local) {
+                 const auto row = segment.begin + r; ++coverage[row];
+@@ -242,6 +267,78 @@
+     if (dtype == DType::BF16) { require(t::verify_reduction(tag, actual, reference, {1. / 256, 1. / 256, 2. / 256}) == 0, "BF16 projection exceeds oracle criterion"); }
+     std::printf("PASS %s: direct owned shards, exact encoded rows, FP64 oracle and graph replay\n", tag.c_str());
+ }
++void input_columns(World& world, QType codec, int T) {
++    constexpr int N = 2560, K = 6144;
++    const auto host = make_weight(codec, N, K, 9121);
++    Loaded loaded(world, host, q::WeightPartition::InputColumns, 1);
++    std::vector<std::uint16_t> values(std::size_t(K) * T);
++    std::uint32_t random = 2751;
++    for (auto& value : values) { random = random * 1664525U + 1013904223U; value = t::f32_to_bf16(float(int(random >> 16) - 32768) / 32768); }
++    std::vector<DeviceBuffer> input, output;
++    std::vector<std::unique_ptr<WorkspaceArena>> work;
++    std::vector<Tensor> partials;
++    for (int rank = 0; rank < int(world.ids.size()); ++rank) {
++        world.devices[rank]->bind_to_current_thread();
++        const auto part = loaded.weight->shards[rank].units;
++        std::vector<std::uint16_t> local(std::size_t(part.count) * T);
++        for (int col = 0; col < T; ++col) { std::copy_n(values.data() + col * K + part.begin, part.count, local.data() + col * part.count); }
++        input.emplace_back(local.size() * 2); input.back().copy_from_host(local.data(), local.size() * 2);
++        output.emplace_back(std::size_t(N) * T * 4);
++        partials.emplace_back(output.back().p, DType::FP32, std::initializer_list<std::int32_t>{N, T});
++        work.push_back(std::make_unique<WorkspaceArena>(1 << 20));
++    }
++    world.devices[0]->bind_to_current_thread(); DeviceBuffer combined(std::size_t(N) * T * 2);
++    Tensor out(combined.p, DType::BF16, {N, T});
++    const auto call = [&] {
++        world.launch([&](int rank, cudaStream_t stream) {
++            const auto& shard = loaded.weight->shards[rank];
++            Tensor x(input[rank].p, DType::BF16, {shard.weight.k, T});
++            q::execution::parallel_projection(x, shard.weight, partials[rank], ops::LinearPolicy::A16Only, *work[rank], stream, ops::ProjectionOrder::Throughput);
++        }, [&](int, cudaStream_t) {});
++        ops::projection_sum(partials, out, world.devices[0]->stream);
++    };
++    call(); world.devices[0]->synchronize();
++    std::vector<std::uint16_t> eager(std::size_t(N) * T), got(eager.size());
++    combined.copy_to_host(eager.data(), eager.size() * 2);
++    DecodeGraphDefinition definition; DecodeGraphExecutable graph;
++    definition.capture(world.devices[0]->stream, call); graph.instantiate(definition); graph.launch(world.devices[0]->stream);
++    world.devices[0]->synchronize(); combined.copy_to_host(got.data(), got.size() * 2);
++    require(got == eager, "input-column projection graph differs from eager");
++    std::vector<std::vector<float>> partial_values(world.ids.size());
++    for (int rank = 0; rank < int(world.ids.size()); ++rank) {
++        world.devices[rank]->bind_to_current_thread(); partial_values[rank].resize(std::size_t(N) * T);
++        output[rank].copy_to_host(partial_values[rank].data(), output[rank].bytes);
++    }
++    std::vector<double> actual, reference;
++    for (int row = 0; row < N; row += 37) {
++        for (int col = 0; col < T; col += col + 1 < T ? std::min(127, T - 1 - col) : 1) {
++            double total = 0, partial_sum = 0, partial_magnitude = 0;
++            for (int rank = 0; rank < int(world.ids.size()); ++rank) {
++                const auto part = loaded.weight->shards[rank].units;
++                double sum = 0, magnitude = 0;
++                for (int k = part.begin; k < part.begin + part.count; ++k) {
++                    const double term = qw::logical_weight_fp64(host, row, k) * t::bf16_to_f32(values[col * K + k]);
++                    sum += term; magnitude += std::abs(term);
++                }
++                const double measured = partial_values[rank][col * N + row];
++                require(std::abs(measured - sum) <= magnitude * part.count * std::ldexp(1., -24) + 1e-30,
++                        "local input-column dot exceeds FP32 accumulation bound");
++                total += sum; partial_sum += measured; partial_magnitude += std::abs(measured);
++            }
++            const double measured = t::bf16_to_f32(got[col * N + row]);
++            require(std::abs(measured - partial_sum) <= std::abs(partial_sum) / 256 +
++                        partial_magnitude * world.ids.size() * std::ldexp(1., -24) + 1e-30,
++                    "projection sum exceeds FP32 sum plus BF16 rounding bound");
++            actual.push_back(measured); reference.push_back(total);
++        }
++    }
++    require(t::verify_reduction("GDN input-column projection", actual, reference, {1. / 256, 1. / 256, 2. / 256}) == 0,
++            "input-column projection exceeds full FP64 dot oracle");
++    std::printf("PASS input-column TP%zu N=%d K=%d T=%d codec=%d: exact weights, FP64 partial/full oracle, graph replay\n",
++                world.ids.size(), N, K, T, int(codec));
++    world.devices[0]->bind_to_current_thread();
++}
++
+ void wide_collapse(World& world) {
+     constexpr int H = 2560, S = 4, T = 65;
+     std::vector<std::uint16_t> norm(H * S * T), logits(norm.size());
+@@ -385,10 +482,20 @@
+     std::printf("PASS TP HC codec=%d T=%d inject=%d: owned stream/row shards, FP64 oracle, graph replay\n", int(codec), T, injection);
+ }
+ }
+-int main() {
++int main(int argc, char** argv) {
+     try {
+         int count = 0; if (cudaGetDeviceCount(&count) != cudaSuccess || count < 2) { return 77; }
+-        count = std::min(count, 4); World world(count);
++        count = std::min(count, 4);
++        if (argc == 2 && std::string(argv[1]) == "--input-columns") {
++            for (int ranks = 2; ranks <= count; ++ranks) {
++                World subset(ranks);
++                for (auto codec : {QType::BF16, QType::Q8_G32_FP16, QType::Q4_G64_FP16}) {
++                    for (int columns : {1, 4, 8, 9, 31, 32, 33, 63, 64, 65, 257, 2048}) { input_columns(subset, codec, columns); }
++                }
++            }
++            return 0;
++        }
++        World world(count);
+         wide_collapse(world);
+         for (auto codec : {QType::BF16, QType::Q8_G32_FP16}) {
+             projection(world, codec, 512, 2560, 5, DType::BF16, false, false, true);
+--- a/include/infernix/ops/projection_fp32.h
++++ b/include/infernix/ops/projection_fp32.h
+@@ -37,6 +37,19 @@
+  * exact. The summation order again depends only on K. K is a multiple of 8 and at most 3072; the
+  * weight's padded K is a multiple of G.
+  */
+-void projection_fp32(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
++// Throughput permits a different FP32 summation order across batch shapes; the
++// represented-weight oracle and error bound are unchanged. Use BatchInvariant
++// where stable logits across batching are required.
++enum class ProjectionOrder { BatchInvariant, Throughput };
++void projection_fp32(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream,
++                     ProjectionOrder order = ProjectionOrder::BatchInvariant);
++
++/** Sum 2..4 same-shaped contiguous FP32 projection partials in supplied order,
++ * accumulating in FP32 and rounding once to contiguous BF16 output. Operands
++ * are non-overlapping; input pointers may address accessible peer memory.
++ * Oracle: FP64 sum of represented FP32 values, with FP32 summation error plus
++ * BF16 output rounding. No allocation or persistent state.
++ */
++void projection_sum(std::span<const Tensor> partials, Tensor& output, cudaStream_t stream);
+ 
+ } // namespace infernix::ops
+--- a/src/ops/projection_fp32/projection_fp32.cu
++++ b/src/ops/projection_fp32/projection_fp32.cu
+@@ -1,7 +1,10 @@
+ #include "infernix/ops/projection_fp32.h"
++#include "core/cuda_function_attributes.h"
+ #include "ops/projection_fp32/projection_fp32_route.h"
+ #include "ops/projection_fp32/projection_fp32_mma.h"
+ 
++#include "ops/linear/q8/q8_sliced_k_launch.cuh"
++
+ #include <cuda_bf16.h>
+ #include <cuda_fp16.h>
+ 
+@@ -14,6 +17,13 @@
+ namespace {
+ 
+ using bf16 = __nv_bfloat16;
++struct ProjectionFloatOutput {
++    float* data;
++    int rows;
++    __device__ __forceinline__ void store(int row, int token, float value) const {
++        data[std::size_t(token) * rows + row] = value;
++    }
++};
+ 
+ constexpr int kThreads     = 256;
+ constexpr int kWarps       = kThreads / 32;
+@@ -463,11 +473,7 @@
+ 
+ template <class Codec>
+ void launch_tall(const Tensor& x, int k, int columns, int rows, const Codec& codec, Tensor& out, cudaStream_t stream) {
+-    static const bool configured = [] {
+-        return cudaFuncSetAttribute(projection_tall_kernel<Codec>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+-                                    static_cast<int>(kTallMaxSharedBytes)) == cudaSuccess;
+-    }();
+-    require(configured, "the tall kernel's shared memory could not be configured");
++    prepare_cuda_shared<projection_tall_kernel<Codec>>(static_cast<int>(kTallMaxSharedBytes));
+     const int rows_per_cta   = kTallWarps * kTallRowsPerWarp;
+     const std::size_t staged = static_cast<std::size_t>(columns) * k * sizeof(bf16);
+     projection_tall_kernel<Codec><<<(rows + rows_per_cta - 1) / rows_per_cta, kTallThreads, staged, stream>>>(
+@@ -493,8 +499,8 @@
+ 
+ } // namespace
+ 
+-void projection_fp32(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+-    detail::projection_fp32_route(x, weight, out, detail::ProjectionRoute::Automatic, stream);
++void projection_fp32(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream, ProjectionOrder order) {
++    detail::projection_fp32_route(x, weight, out, order == ProjectionOrder::Throughput ? detail::ProjectionRoute::Throughput : detail::ProjectionRoute::Automatic, stream);
+ }
+ 
+ void projection_fp32(const Tensor& x, std::span<const Tensor* const> weights, Tensor& out,
+@@ -519,7 +525,12 @@
+             "out must be FP32 [N, T]");
+     const dim3 grid((rows + kRowsPerCta - 1) / kRowsPerCta, (columns + kColumns - 1) / kColumns);
+     const std::size_t staged = static_cast<std::size_t>(std::min(kColumns, columns)) * k * sizeof(bf16);
+-    if (!q4 && columns <= kTallMaxColumns && tall_route(rows, columns, kTallMinColumnsQ8, route)) {
++    if (!q4 && route == ProjectionRoute::Throughput && columns > 8 && padded_k % 128 == 0 && aligned16(weight.scales)) {
++        using Schedule = Q8A16SlicedKMmaSchedule<64, 4, 1, 1, Q8ScaleAccess::Shared,
++            Cache::ca, Cache::cg, Q8ActivationStage::ActiveOnly, 0, 64, false, 2>;
++        launch_q8_a16_sliced_k_mma<Schedule>(q8_linear_operands(x, weight),
++            ProjectionFloatOutput{static_cast<float*>(out.data), rows}, LinearIdentityEpilogue{}, stream);
++    } else if (!q4 && columns <= kTallMaxColumns && tall_route(rows, columns, kTallMinColumnsQ8, route)) {
+         launch_tall(x, k, columns, rows,
+                     TallQ8{static_cast<const std::int8_t*>(weight.qdata), static_cast<const __half*>(weight.scales),
+                            padded_k},
+@@ -573,11 +584,7 @@
+     } else if (columns <= kTallMaxColumns && tall_route(rows, columns, kTallMinColumnsBf16, route)) {
+         launch_tall(x, k, columns, rows, TallBf16{segments, k}, out, stream);
+     } else if (columns >= kWideMinColumns) {
+-        static const bool configured = [] {
+-            return cudaFuncSetAttribute(projection_wide_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+-                                        kWideSharedBytes) == cudaSuccess;
+-        }();
+-        require(configured, "the wide kernel's shared memory could not be configured");
++        prepare_cuda_shared<projection_wide_kernel>(kWideSharedBytes);
+         projection_wide_kernel<<<dim3((rows + kWideRows - 1) / kWideRows, (columns + kWideColumns - 1) / kWideColumns),
+                                  kWideThreads, kWideSharedBytes, stream>>>(
+             static_cast<const bf16*>(x.data), k, columns, segments, static_cast<float*>(out.data));
+@@ -597,4 +604,31 @@
+     }
+ }
+ 
++namespace {
++struct ProjectionPartials { const float* values[4]{}; int count = 0; };
++__global__ void sum_projection_partials(ProjectionPartials partials, std::size_t elements, bf16* out) {
++    const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (i >= elements) { return; }
++    float sum = partials.values[0][i];
++    for (int rank = 1; rank < partials.count; ++rank) { sum += partials.values[rank][i]; }
++    out[i] = __float2bfloat16_rn(sum);
++}
++}
++void projection_sum(std::span<const Tensor> partials, Tensor& output, cudaStream_t stream) {
++    require(partials.size() >= 2 && partials.size() <= 4, "sum requires two to four partials");
++    require(output.data && output.dtype == DType::BF16 && output.is_contiguous(), "sum output must be contiguous BF16");
++    ProjectionPartials inputs; inputs.count = partials.size();
++    for (std::size_t rank = 0; rank < partials.size(); ++rank) {
++        const auto& tensor = partials[rank];
++        require(tensor.data && tensor.dtype == DType::FP32 && tensor.is_contiguous(), "sum partial must be contiguous FP32");
++        for (int d = 0; d < 4; ++d) { require(tensor.ne[d] == output.ne[d], "sum shapes differ"); }
++        inputs.values[rank] = static_cast<const float*>(tensor.data);
++    }
++    const auto elements = output.bytes() / 2;
++    if (!elements) { return; }
++    sum_projection_partials<<<(elements + 255) / 256, 256, 0, stream>>>(inputs, elements, static_cast<bf16*>(output.data));
++    const auto error = cudaGetLastError();
++    if (error != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(error)); }
++}
++
+ } // namespace infernix::ops
+--- a/src/models/qwen4_exp/execution/parallel_projection.h
++++ b/src/models/qwen4_exp/execution/parallel_projection.h
+@@ -7,7 +7,8 @@
+ 
+ namespace infernix::models::qwen4_exp::execution {
+ inline void parallel_projection(const Tensor& x, const Weight& w, Tensor& out,
+-                                ops::LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream) {
++                                ops::LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream,
++                                ops::ProjectionOrder order = ops::ProjectionOrder::BatchInvariant) {
+     if (out.dtype == DType::BF16) {
+         ops::linear(x, w, out, policy, workspace, stream);
+     } else if (out.dtype != DType::FP32) {
+@@ -17,7 +18,7 @@
+         const Tensor* rows[] = {&matrix};
+         ops::projection_fp32(x, rows, out, stream);
+     } else {
+-        ops::projection_fp32(x, w, out, stream);
++        ops::projection_fp32(x, w, out, stream, order);
+     }
+ }
+ } // namespace infernix::models::qwen4_exp::execution
+--- a/src/ops/projection_fp32/projection_fp32_route.h
++++ b/src/ops/projection_fp32/projection_fp32_route.h
+@@ -14,6 +14,7 @@
+ namespace infernix::ops::detail {
+ 
+ enum class ProjectionRoute {
++    Throughput, // Q8 group-scaled Tensor Core accumulation; shape-dependent FP32 order
+     Automatic, // what projection_fp32 selects
+     Narrow,    // the narrow (or, from 64 columns, wide) mapping
+     Tall,      // the tall mapping (BF16 and q8_g32_fp16, at most 16 columns)
+--- a/tests/cmake/CoreTests.cmake
++++ b/tests/cmake/CoreTests.cmake
+@@ -121,3 +121,6 @@
+   LIBRARIES infernix_model_runtime)
+ set_tests_properties(infernix_parallel_expert_stream_test PROPERTIES
+   SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;multi-gpu")
++
++add_test(NAME infernix_parallel_input_columns_test COMMAND infernix_parallel_weights_test --input-columns)
++set_tests_properties(infernix_parallel_input_columns_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300 RUN_SERIAL TRUE LABELS "gpu;multi-gpu")

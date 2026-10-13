@@ -9,7 +9,64 @@ contract.
 
 ## 1. Product execution model
 
-The Generation Engine uses one GPU, one resident model and a `max_concurrency=1..8` fixed at startup.
+The Generation Engine defaults to one GPU, one resident model and a `max_concurrency=1..8` fixed at startup.
+Qwen4Exp additionally supports experimental, explicit 2–4 GPU weight, state and expert partitioning;
+[multi-GPU ownership and validation](multi-gpu-5060-ti-design.md) defines that path's limits.
+Immutable Model data owns each GPU's encoded weight shards. Program owns peer contexts, transfer
+events, graph-stable scratch and owner-specific expert caches. Whole attention head groups have
+two rotating owners per layer; each head's KV and exact window share its projection owner.
+GDN recurrence, convolution history and speculative records follow the GDN head groups on every
+rank. GDN projections remain local through recurrence, and output-row owners gather the
+disjoint recurrent outputs directly from each other. HC stages its small normalization
+vector into per-rank scratch before fused computation. Primary expert-cache VMM chunks
+also grant the selected peers access because long prefill lends those chunks to shared
+activations and call metadata; physical allocation ownership remains on the primary.
+The scheduler, shared QSA indexer and small sequence metadata stay on the primary.
+
+Wide TP prefill uses copy-engine transfers. Large activation broadcasts scatter
+pieces from the primary and exchange them among nonempty weight owners, joining
+all readers before buffer reuse. HC up-projection owners collapse their local
+residual streams before returning one feature shard. Each expert owner borrows
+cache frames for its own two-layer ExpertStream ring; all chunks visiting a layer
+reuse the records, and completion/cancellation joins copies before returning the
+loan. These are temporary cache loans, not additional persistent weight or state
+copies. Small decode transfers retain the latency-oriented kernel path.
+For wide QSA calls, the primary selects blocks once beside the shared pooled-key
+index. Only the selected IDs/counts are copied to the two KV owners, which attend
+to their local K/V. Selection and its transfers use existing transient scratch;
+the persistent KV layout is unchanged. Attention projection rows remain on those
+owners through normalization, RoPE, K/V append, attention and output gating.
+Output-projection row owners pull the gated head pieces directly from the KV
+owners. The primary retains the indexer; MTP catch-up uses the same ownership
+and preserves its key-record and tail-update boundaries.
+
+Wide main-expert calls contract each owner's weighted outputs locally into FP32
+partials, transfer those compact partials, then sum and round once to BF16 on the
+primary. Narrow calls preserve ordered slot gathering. The existing output arena
+holds the partials after its last reader; no extra persistent output copy is kept.
+Selective wide expert scratch is borrowed from each owner's expert cache and
+returned after all readers join, while pitched-transfer buffers remain native.
+
+An explicit four-GPU `pipeline_parallel` startup option assigns each half of the
+48-block decoder to one TP2 pair. Immutable weight loading, expert dispatch, KV
+ownership and recurrent layers use the same layout. Program interleaves stage
+submissions with independent primary scratch/streams, joins both at bounded
+Engine step boundaries, and restores the ordinary primary stream before another
+lane, cancellation or final/MTP work. The scheduler and publication contracts
+remain common. The default keeps all selected GPUs participating in each layer.
+
+The alternative four-GPU TP option `fixed_kv_owners` keeps all attention heads
+on the first two ranks, including their weight rows, KV pages and exact windows.
+It leaves GDN and expert placement unchanged and is mutually exclusive with
+pipeline staging. Rotating attention ownership remains the default.
+
+For multi-device graph replay, Program owns a single host worker for n-gram row
+reads. It starts the read before a potentially blocking graph launch and joins
+before round staging or lane references change. Gate release, including I/O
+failure, is independent of the launching thread; diagnostics return to that
+thread. This preserves read overlap without coupling GPU progress to launch
+return. Flash-Next also honors the common eager-execution option.
+
 A bounded wait queue is ordered by submission; resident requests acquire resources incrementally per
 finite execution unit and can be paused and resumed under resource pressure.
 Each round, the decode-ready requests holding an execution permit form one compact batch, and prefill

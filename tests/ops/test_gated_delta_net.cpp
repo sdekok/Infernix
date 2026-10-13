@@ -270,6 +270,7 @@ int verify_heads(const std::string& label, std::span<const double> got,
     }
     std::vector<double> head_got(head_size), head_ref(head_size);
     int failures = 0;
+
     for (int h = 0; h < value_heads; ++h) {
         if (state) {
             std::copy_n(got.data() + h * head_size, head_size, head_got.data());
@@ -677,6 +678,18 @@ int main() {
     }
 
     int failures = 0;
+#ifdef INFERNIX_GDN_SHARDS_ONLY
+    for (int heads : {4, 5, 6, 8}) {
+        for (int tokens : {1, 15, 16, 17, 65}) {
+            failures += run_case({"TP owned head group", heads, 3 * heads, tokens, true},
+                81200U + heads * 100 + tokens, InputPattern::Ordinary, true);
+        }
+        failures += batch_update_case({"TP selected slot", heads, 3 * heads, 1, true},
+            {7, 2, 5}, {7, 2, 5}, 8, 81500U + heads);
+    }
+    return failures ? 1 : 0;
+#endif
+
 
     const std::size_t interval = ops::gated_delta_net_workspace_capacity_bytes(16, 48, 15, 17);
     const std::size_t witness  = ops::gated_delta_net_workspace_capacity_bytes(16, 48, 17, 17);

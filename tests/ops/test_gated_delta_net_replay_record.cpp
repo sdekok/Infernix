@@ -46,8 +46,7 @@ int verify_equal(const std::string& label, const std::vector<std::uint16_t>& lhs
 }
 
 int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
-             std::vector<std::int32_t> valid_columns, std::uint32_t seed) {
-    constexpr std::int32_t kQkHeads = 16;
+             std::vector<std::int32_t> valid_columns, std::uint32_t seed, int kQkHeads = 16) {
     const bool dense                = valid_columns.empty();
     if (dense) { valid_columns.assign(static_cast<std::size_t>(batch), width); }
     const std::int32_t columns       = width * batch;
@@ -328,6 +327,10 @@ int main() {
         failures += run_case(32, width, 4, {1, width, width / 2, 2}, 2330U + width);
     }
     failures += run_case(48, 5, 3, {5, 3, 1}, 1791U);
+    for (int heads : {4, 5, 6, 8}) {
+        failures += run_case(heads * 3, 5, 3, {5, 3, 1}, 82000U + heads, heads);
+        failures += run_case(heads * 3, 17, 1, {}, 82100U + heads, heads);
+    }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net_replay_record\n";
     return failures == 0 ? 0 : 1;
 }

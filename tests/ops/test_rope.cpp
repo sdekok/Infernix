@@ -565,6 +565,13 @@ int main() {
     const auto execution = device.execution_view().on_stream(nullptr);
     int failures         = 0;
 
+    // Flash-Next's uniquely owned KV head and its twelve query heads.
+    for (int axes : {1, 3}) {
+        for (int tokens : {1, 3, 8, 256, 2048}) {
+            failures += run_pair_case(execution, {"Flash-Next owner", 256, 64, axes, tokens, kTextTheta},
+                                      12, 1, 131072 - tokens, 0, 0, 0, true);
+        }
+    }
     failures += run_scaling_validation(execution);
     failures += run_pair_case(
         execution, {"vision default identity", 72, 72, 2, 8, kVisionTheta, {1.0F, 262144}, true},

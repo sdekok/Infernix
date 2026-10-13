@@ -18,7 +18,13 @@
 
 namespace infernix::models::qwen4_exp::execution {
 
-using LinearParameters = ops::SingleProjectionWeight;
+struct LinearParameters : ops::SingleProjectionWeight {
+    const PartitionedWeight* parallel = nullptr;
+    LinearParameters() = default;
+    LinearParameters(ops::SingleProjectionWeight weight) : ops::SingleProjectionWeight(weight) {}
+    LinearParameters(Weight weight, ops::LinearPolicy policy, const PartitionedWeight* shards)
+        : ops::SingleProjectionWeight{weight, policy}, parallel(shards) {}
+};
 
 struct HyperConnectionParameters {
     Tensor norm;           // BF16 [S*H]
@@ -44,9 +50,11 @@ struct GdnParameters {
     Tensor convolution;          // BF16 [C, K]
     Tensor norm;                 // BF16 [value head dim]
     LinearParameters output;
+    std::vector<Tensor> parallel_convolution;
 };
 
 struct MoeParameters {
+    std::optional<LinearParameters> parallel_router;
     Tensor router;                   // BF16 [H, E]: one expert row per column (FP32 logits)
     Tensor shared_score;             // BF16 [H, 1]: the shared-expert gate row
     LinearParameters shared_gate_up; // [2 * I_shared, H]: gate rows, then up rows
@@ -64,6 +72,9 @@ struct PleParameters {
 
 // The MTP drafter (design §11.2).
 struct MtpParameters {
+    std::optional<LinearParameters> parallel_router;
+    const PartitionedWeight* parallel_experts_gate_up = nullptr;
+    const PartitionedWeight* parallel_experts_down = nullptr;
     Tensor embedding_norm, hidden_norm; // BF16 [H], [S*H]
     LinearParameters embedding_projection, hidden_projection;
     HyperConnectionParameters attn_hc, mlp_hc, final_mixer;
@@ -99,6 +110,7 @@ public:
     Tensor output_head; // BF16 [H, V]: one vocabulary row per column (FP32 logits)
     // Recipe B's 8-bit head (q8_g32_fp16 [V, H], FP32 logits); output_head is then empty.
     std::optional<LinearParameters> output_head_q8;
+    std::optional<LinearParameters> parallel_head;
     HyperConnectionParameters final_mixer;
     std::vector<BlockParameters> layers;
     std::optional<MtpParameters> mtp;
@@ -108,6 +120,7 @@ public:
 private:
     // Device copy of every layer's ExpertScales, [layers][E].
     DeviceBuffer scales_;
+    std::vector<DeviceBuffer> parallel_convolution_;
 };
 
 } // namespace infernix::models::qwen4_exp::execution

@@ -730,7 +730,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
 // entries as a set, and the route-log copy. The dispatch arrays start as garbage, and a captured
 // call is replayed on new ids, so neither route may depend on memory cleared outside the call.
 // Entries <= 1024 take the one-CTA kernel, more the count/scan/scatter kernels.
-void test_dispatch(int experts, int entries, std::uint32_t seed) {
+void test_dispatch(int experts, int entries, std::uint32_t seed, int owner = 0, int owner_count = 1, int layout = 0) {
     std::mt19937 rng(seed);
     std::uniform_int_distribution<int> pick(0, experts - 1);
     const auto random_ids = [&] {
@@ -739,6 +739,10 @@ void test_dispatch(int experts, int entries, std::uint32_t seed) {
         for (auto& id : ids) { id = (rng() % 4 == 0) ? pick(rng) % 8 : pick(rng); }
         return ids;
     };
+    std::vector<std::int32_t> owners(experts);
+    for (int e = 0; e < experts; ++e) { owners[e] = layout == 1 ? 2 + e / (experts / 2) : layout == 2 ? (e < 124 ? 0 : e < 248 ? 1 : e < 380 ? 2 : 3) : e % owner_count; }
+    std::int32_t* d_owners = nullptr;
+    if (layout) { cuda_check(cudaMalloc(&d_owners, experts * sizeof(std::int32_t)), "owners alloc"); cuda_check(cudaMemcpy(d_owners, owners.data(), experts * sizeof(std::int32_t), cudaMemcpyHostToDevice), "owners copy"); }
     std::int32_t* d_ids = nullptr;
     std::int32_t* d_log = nullptr;
     void* d_dispatch    = nullptr;
@@ -763,7 +767,7 @@ void test_dispatch(int experts, int entries, std::uint32_t seed) {
                    "copy");
         cuda_check(cudaMemcpy(log.data(), d_log, sizeof(std::int32_t) * entries, cudaMemcpyDeviceToHost), "copy");
         std::vector<std::vector<std::int32_t>> by_expert(experts);
-        for (int i = 0; i < entries; ++i) { by_expert[ids[i]].push_back(i); }
+        for (int i = 0; i < entries; ++i) { if (owners[ids[i]] == owner) { by_expert[ids[i]].push_back(i); } }
         // The first mismatching field, so a failure names what went wrong.
         const char* first_bad = log == ids ? nullptr : "route log";
         int used = 0, start = 0, bad_expert = -1;
@@ -783,7 +787,7 @@ void test_dispatch(int experts, int entries, std::uint32_t seed) {
             if (first_bad != nullptr) { bad_expert = e; }
             start += c;
         }
-        if (first_bad == nullptr && offsets[experts] != entries) { first_bad = "total offset"; }
+        if (first_bad == nullptr && offsets[experts] != start) { first_bad = "total offset"; }
         if (first_bad == nullptr && job_count != used) { first_bad = "job count"; }
         const bool ok = first_bad == nullptr;
         if (ok) {
@@ -797,7 +801,7 @@ void test_dispatch(int experts, int entries, std::uint32_t seed) {
 
     const auto first = random_ids();
     cuda_check(cudaMemcpy(d_ids, first.data(), sizeof(std::int32_t) * entries, cudaMemcpyHostToDevice), "copy");
-    infernix::ops::moe_dispatch(routing, experts, dispatch, d_log, nullptr);
+    infernix::ops::moe_dispatch(routing, experts, dispatch, d_log, nullptr, owner, owner_count, d_owners);
     cuda_check(cudaDeviceSynchronize(), "dispatch");
     verify(first, "eager");
 
@@ -806,7 +810,7 @@ void test_dispatch(int experts, int entries, std::uint32_t seed) {
     cudaGraphExec_t exec = nullptr;
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
     cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "capture");
-    infernix::ops::moe_dispatch(routing, experts, dispatch, d_log, stream);
+    infernix::ops::moe_dispatch(routing, experts, dispatch, d_log, stream, owner, owner_count, d_owners);
     cuda_check(cudaStreamEndCapture(stream, &graph), "capture");
     cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
     for (int replay = 0; replay < 2; ++replay) {
@@ -825,16 +829,39 @@ void test_dispatch(int experts, int entries, std::uint32_t seed) {
     cudaFree(d_dispatch);
     cudaFree(d_log);
     cudaFree(d_ids);
+    cudaFree(d_owners);
 }
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (infernix::test::cuda_unavailable()) {
         std::printf("SKIP: no usable CUDA device\n");
         return 77;
     }
     try {
+        if (argc == 2 && std::strcmp(argv[1], "--owners") == 0) {
+            for (int layout : {0, 1, 2}) for (int rank = 0; rank < 4; ++rank) {
+                for (int entries : {1, 10, 1024, 1025, 20480}) { test_dispatch(512, entries, 100U + entries, rank, 4, layout); }
+            }
+            return g_failures == 0 ? 0 : 1;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--multi-device") == 0) {
+            int devices = 0;
+            cuda_check(cudaGetDeviceCount(&devices), "device count");
+            if (devices < 2) { return 77; }
+            for (int device = 0; device < std::min(devices, 4); ++device) {
+                cuda_check(cudaSetDevice(device), "select expert owner");
+                std::printf("Expert owner GPU %d\n", device);
+                test_layer(12, 1, 10, 7);
+                test_layer(9, 5, 3, 13);
+                test_layer(4, 16, 3, 17);
+                test_layer(12, 1, 10, 41, moe::ExpertActivation::kA16);
+                test_layer(9, 5, 3, 47, moe::ExpertActivation::kA16);
+                test_layer(4, 16, 3, 71, moe::ExpertActivation::kA16);
+            }
+            return g_failures == 0 ? 0 : 1;
+        }
         for (const int entries : {1, 10, 1024, 1025, 40960}) { test_dispatch(512, entries, 100U + entries); }
         test_dispatch(1024, 1024, 31); // every expert slot of the one-CTA kernel
         test_dispatch(3, 1000, 37);    // few experts, long runs per expert

@@ -67,7 +67,7 @@ struct MoeDispatch {
 /// unspecified). When `route_log` is not null it also receives a copy of the k*T ids. The arrays need
 /// no clearing between calls, so a captured call replays correctly.
 void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& dispatch,
-                  std::int32_t* route_log, cudaStream_t stream);
+                  std::int32_t* route_log, cudaStream_t stream, int owner_rank = 0, int owner_count = 1, const std::int32_t* owners = nullptr);
 
 /// The layer's routed expert records: expert e's record is at frame_base + frames[e] *
 /// record_stride when frames[e] >= 0, else at host_records + e * record_stride (pinned host
@@ -222,5 +222,13 @@ void moe_experts_cpu_wait(const Tensor& x, const MoeDispatch& dispatch, const Mo
 /// y = bf16(sum_slot w * outputs + shared_gate * shared), BF16 [H, T].
 void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared, Tensor& y,
                  cudaStream_t stream);
+
+// Weighted owner-local contraction. Unowned output slots are not read. There is
+// no BF16 intermediate: FP32 partials are summed in owner order, then shared is
+// added and the result rounded once to BF16. The slot grouping changes FP32 order.
+void moe_combine_owner(const Tensor& outputs, const MoeRouting& routing, int owner, int owners,
+                       Tensor& partial, cudaStream_t stream, const std::int32_t* owner_table = nullptr);
+void moe_combine_partials(const Tensor& partials, const MoeRouting& routing, const Tensor& shared,
+                          Tensor& y, cudaStream_t stream);
 
 } // namespace infernix::ops

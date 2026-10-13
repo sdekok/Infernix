@@ -12,6 +12,79 @@ Generation works through `infernix`, `infernix-serve` and `infernix_bench`, with
 drafter (`--spec mtp`), n-gram copy proposals, images and video (`--vision`), and in
 `infernix-serve` the hybrid prefix cache. Not yet supported: CausalScoring (perplexity).
 
+## Experimental multi-GPU
+
+On Linux, `infernix`, `infernix-serve` and `infernix_bench` accept
+`--device 0 --parallel-devices 0,1,2,3` for 2–4 SM120 GPUs with P2P between every
+selected device pair. The first ordinal must match `--device`. Omitting the list
+selects the original single-GPU path.
+
+The text and MTP dense matrices load directly into their GPU-owned shards,
+including paired shared-expert projections, hyper-connections and heads. Main
+experts use disjoint owner caches; MTP experts are partitioned by expert. Small
+norm vectors and the host token embedding retain their native ownership.
+Each attention layer has two rotating owners for its two KV heads and matching
+query/key/value projection rows. GDN recurrent state, convolution history and
+speculative records are split by head group across all selected GPUs. No full
+dense-matrix or KV/recurrent-state copy is kept on GPU 0.
+
+With four GPUs, `--pipeline-parallel` selects TP2+PP2 for the 48-block model:
+blocks0–23 use the first pair and blocks24–47 the second pair. Each block's
+dense shards, experts, KV and recurrent state follow that pair without replicas.
+The final vocabulary head and MTP expert banks still use all four GPUs; MTP
+attention uses the second pair. GPU0 remains the residual/scheduling coordinator.
+Long prompts overlap bounded groups of chunks between the two stages. This
+consumes additional primary workspace and can slow short prefill or decode;
+leave the option off for the ordinary TP layout. See the validation record for
+measured tradeoffs and qualification status.
+
+For four-GPU TP, `--fixed-kv-owners` instead keeps every attention layer's two
+KV heads and matching projection rows on the first two listed GPUs. GDN and
+expert ownership still span all four GPUs. This can improve decoding but puts
+more KV pressure on those two expert caches. It cannot be combined with
+`--pipeline-parallel`; rotating KV ownership remains the default.
+
+This path currently requires BF16/Q8 dense weights (recipes A/B) and the full
+main expert bank in RAM. Recipe C's FP8 dense matrices and the SSD expert tier
+are rejected. Vision continues through the existing offload path. Primary
+workspace and per-owner memory still limit context and concurrency; aggregate
+VRAM is not a single allocation pool. KV growth can take memory from each
+owner's expert cache, and shrinking KV can return that memory.
+
+Use the usual artifact and n-gram volume arguments, adding the GPU list:
+
+```bash
+./build/apps/infernix /models/flash-next.infernix \
+  --ngram-volume /models/flash-next.ngram \
+  --device 0 --parallel-devices 0,1,2,3 \
+  --prompt "Explain tensor parallelism briefly." \
+  --max-context 131072 --kv-dtype int8 --max-new 64
+```
+
+Implementation and qualification are experimental. The Dense8 artifact has
+loaded and generated text with sharded state, CUDA graphs and MTP3 on four
+RTX 5060 Ti 16 GB cards. Controlled 512-token, 8K and 64K prompt benchmarks
+reserve 131,072-token INT8 KV capacity. Rotating TP4, fixed-KV TP4 and TP2+PP2
+also completed 131,000-token prompts plus 33 outputs with MTP3, physical KV
+growth and subsequent shrink. Basic OpenAI chat serving passed prefix reuse,
+two concurrent lanes, long-prefill cancellation and subsequent recovery for all
+three layouts, with a requested 262,144-token shared INT8 pool.
+
+These checks do not establish general model quality, warmed 128K throughput or
+broad protocol/load qualification. Pipeline is faster at long uncached prefill
+but can slow decode and cached/short requests. Refer to the
+[current validation record](maintainer/multi-gpu-5060-ti-design.md),
+[performance summary](performance.md#experimental-four-gpu-flash-next) and
+[build/test instructions](../tools/tp4/README.md). Benchmark GPU lists and layouts
+are recorded explicitly; runtime memory statistics cover the primary GPU,
+while weight-load statistics include all dense shards and host-runner samples
+report each GPU separately.
+
+Multi-GPU graph replay uses a Program-owned host worker for n-gram reads: a
+graph launch may wait on the GPU's mapped gate, so that gate cannot depend on
+the launching thread returning to perform I/O. `--no-cuda-graph` also works for
+Flash-Next and provides an eager-execution diagnostic.
+
 ## Requirements
 
 - **GPU.** An RTX 5090 (sm_120a). A **PCIe x16** link matters: expert misses cross PCIe, and an

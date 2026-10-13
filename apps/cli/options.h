@@ -37,6 +37,9 @@ struct Options {
     bool vram_past_budget = false;
     std::uint32_t prefill_chunk  = 1024;
     int device                   = 0;
+    std::vector<int> parallel_devices;
+    bool pipeline_parallel = false;
+    bool fixed_kv_owners = false;
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     // INT8 KV prefills with the fast prompt kernel unless the original kernel is selected.

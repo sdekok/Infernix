@@ -1,0 +1,127 @@
+--- a/src/models/qwen4_exp/execution/parallel.cpp
++++ b/src/models/qwen4_exp/execution/parallel.cpp
+@@ -73,10 +73,10 @@
+         DeviceBuffer expert_scales, staging;
+         std::array<std::size_t, 8> wide_sizes{};
+         std::array<DeviceSpan, 8> wide_views{};
+-        std::size_t wide_workspace_bytes = 0, wide_bytes = 0;
++        std::size_t wide_workspace_bytes = 0, wide_state_bytes = 0, wide_bytes = 0;
+         ExpertResidency::FrameLease wide_lease;
+         DeviceBuffer wide_fallback;
+-        std::unique_ptr<WorkspaceArena> wide_workspace;
++        std::unique_ptr<WorkspaceArena> wide_workspace, wide_state_work;
+         std::array<ScratchBuffer*, 8> buffers() {
+             return {&input, &output, &expert_input, &expert_ids, &expert_outputs,
+                     &expert_dispatch, &expert_work, &resident_work};
+@@ -117,7 +117,7 @@
+         if (devices.empty() || columns <= 0 || static_columns <= 0 || parameters.model.expert_store()) {
+             throw std::invalid_argument("parallel execution requires a nonempty plan and the full expert bank in RAM");
+         }
+-        int max_k = 10240, max_n = 10240, head_n = 0;
++        int max_k = 10240, max_n = 10240;
+         const auto consider = [&](const LinearParameters& linear) {
+             if (!linear.parallel || linear.parallel->shards.size() != devices.size()) {
+                 throw std::invalid_argument("parallel execution requires load-time weight shards");
+@@ -125,13 +125,6 @@
+             max_k = std::max(max_k, linear.weight.k);
+             for (const auto& shard : linear.parallel->shards) { max_n = std::max(max_n, shard.weight.n); }
+         };
+-        const auto consider_head = [&](const LinearParameters& linear) {
+-            if (!linear.parallel || linear.parallel->shards.size() != devices.size()) {
+-                throw std::invalid_argument("parallel head requires load-time weight shards");
+-            }
+-            max_k = std::max(max_k, linear.weight.k);
+-            for (const auto& shard : linear.parallel->shards) { head_n = std::max(head_n, shard.weight.n); }
+-        };
+         const auto hc = [&](const HyperConnectionParameters& h) { consider(h.down); consider(h.up); };
+         const auto attention = [&](const AttentionParameters& a) {
+             consider(a.projection); if (a.index_projection) { consider(*a.index_projection); } consider(a.output);
+@@ -143,7 +136,7 @@
+             consider(*layer.moe.parallel_router); consider(layer.moe.shared_gate_up); consider(layer.moe.shared_down);
+             if (layer.ple) { consider(layer.ple->projection); }
+         }
+-        hc(parameters.final_mixer); consider_head(*parameters.parallel_head);
++        hc(parameters.final_mixer); consider(*parameters.parallel_head);
+         if (parameters.mtp) {
+             const auto& m = *parameters.mtp;
+             hc(m.attn_hc); hc(m.mlp_hc); hc(m.final_mixer); attention(m.attention);
+@@ -151,7 +144,7 @@
+             consider(m.shared_gate_up); consider(m.shared_down);
+             if (!m.parallel_experts_gate_up || !m.parallel_experts_down) { throw std::invalid_argument("MTP experts must be partitioned"); }
+         }
+-        if (parameters.draft_head.rows) { consider_head(*parameters.draft_head.rows); }
++        if (parameters.draft_head.rows) { consider(*parameters.draft_head.rows); }
+         for (std::size_t i = 0; i < devices.size(); ++i) {
+             auto rank = std::make_unique<Rank>();
+             if (i == 0) { rank->device = &primary; }
+@@ -182,8 +175,7 @@
+             auto& rank = *ranks[i]; rank.device->bind_to_current_thread();
+             const auto sizes = [&](int width) -> std::array<std::size_t, 8> {
+                 const auto entries = std::size_t(c.moe.top_k) * width;
+-                return {std::size_t(max_k) * width * 2,
+-                    std::max(std::size_t(max_n) * width, std::size_t(head_n) * std::min(width, static_columns)) * 4,
++                return {std::size_t(max_k) * width * 2, std::size_t(max_n) * width * 4,
+                     std::size_t(c.hidden_size) * width * 2, entries * 4, entries * c.hidden_size * 2,
+                     i ? ops::moe_dispatch_bytes(c.moe.experts, static_cast<int>(entries)) : 0,
+                     i ? ops::moe_experts_workspace_bytes(c.moe.experts, static_cast<int>(entries), width, activation) : 0,
+@@ -200,21 +192,14 @@
+                 return std::max<std::size_t>(1ULL << 20, 8ULL * c.moe.shared_intermediate * width + 4096);
+             };
+             const auto narrow = sizes(static_columns); rank.wide_sizes = sizes(columns);
+-            // These are sources/destinations of concurrent pitched peer DMA.
+-            // Keep native allocations: VMM source views slow that traffic
+-            // on this topology. Heads only project narrow token selections, so
+-            // their vocabulary extent must not multiply the prefill width.
+             const auto buffers = rank.buffers();
+             for (std::size_t j = 0; j < buffers.size(); ++j) {
+-                const bool native_transfer = j < 2;
+-                *buffers[j] = DeviceBuffer(native_transfer ? rank.wide_sizes[j] : narrow[j]);
+-                if (native_transfer) { rank.wide_sizes[j] = 0; }
+-                rank.wide_bytes += align(rank.wide_sizes[j]);
++                *buffers[j] = DeviceBuffer(narrow[j]); rank.wide_bytes += align(rank.wide_sizes[j]);
+             }
+             rank.workspace = std::make_unique<WorkspaceArena>(workspace_bytes(static_columns));
+-            rank.state_work = std::make_unique<WorkspaceArena>(state_bytes(columns));
+-            rank.wide_workspace_bytes = workspace_bytes(columns);
+-            rank.wide_bytes += align(rank.wide_workspace_bytes);
++            rank.state_work = std::make_unique<WorkspaceArena>(state_bytes(static_columns));
++            rank.wide_workspace_bytes = workspace_bytes(columns); rank.wide_state_bytes = state_bytes(columns);
++            rank.wide_bytes += align(rank.wide_workspace_bytes) + align(rank.wide_state_bytes);
+             rank.hc_norm = DeviceBuffer(std::size_t(c.residual_width()) * 2);
+             rank.hc_partials = DeviceBuffer(hc_bytes); rank.hc_inverse = DeviceBuffer(4 * 16 * sizeof(float));
+             if (i == 0) { rank.hc_gathered = DeviceBuffer(hc_bytes); continue; }
+@@ -373,13 +358,14 @@
+         const auto buffers = r.buffers();
+         for (std::size_t j = 0; j < buffers.size(); ++j) { r.wide_views[j] = r.wide_sizes[j] ? area.alloc_bytes(r.wide_sizes[j]) : DeviceSpan{}; }
+         r.wide_workspace = std::make_unique<WorkspaceArena>(area.alloc_bytes(r.wide_workspace_bytes));
++        r.wide_state_work = std::make_unique<WorkspaceArena>(area.alloc_bytes(r.wide_state_bytes));
+     }
+     // No throwing work after this point: either every rank changes views or none does.
+     for (auto& rank : p.ranks) {
+         auto& r = *rank;
+         const auto buffers = r.buffers();
+-        for (std::size_t j = 0; j < buffers.size(); ++j) { if (r.wide_sizes[j]) { buffers[j]->use(r.wide_views[j]); } }
+-        r.workspace.swap(r.wide_workspace);
++        for (std::size_t j = 0; j < buffers.size(); ++j) { buffers[j]->use(r.wide_views[j]); }
++        r.workspace.swap(r.wide_workspace); r.state_work.swap(r.wide_state_work);
+     }
+     p.wide_active = true; return true;
+ }
+@@ -388,7 +374,7 @@
+     auto& p = *impl_;
+     for (auto& r : p.ranks) {
+         for (auto* buffer : r->buffers()) { buffer->restore(); }
+-        r->workspace.swap(r->wide_workspace);
++        r->workspace.swap(r->wide_workspace); r->state_work.swap(r->wide_state_work);
+     }
+     p.wide_active = false;
+ }
+@@ -412,7 +398,7 @@
+             cache.give_back(r.wide_lease, r.device->stream);
+         }
+         if (r.wide_fallback.p) { r.device->synchronize(); r.wide_fallback = {}; }
+-        r.wide_workspace.reset(); p.done(i);
++        r.wide_workspace.reset(); r.wide_state_work.reset(); p.done(i);
+     }
+     for (int i = 1; i < size(); ++i) { p.wait(i); }
+ }

@@ -1,6 +1,8 @@
 #include "models/qwen4_exp/execution/parameters.h"
 
 #include "core/weight_view.h"
+#include "core/device.h"
+#include "models/qwen4_exp/head_partition.h"
 
 #include <array>
 #include <limits>
@@ -35,6 +37,27 @@ public:
     }
 
     LinearParameters linear(std::span<const WeightId> ids) const {
+        const auto& first = model_.weight(ids.front());
+        if (!first.view.parts.empty()) {
+            if (const auto* sharded = model_.parallel_weight(first.view.parts.front().parent)) {
+                std::uint64_t end = 0;
+                auto policy = ops::LinearPolicy::AllowA4;
+                for (const auto id : ids) {
+                    const auto& bound = model_.weight(id);
+                    policy = std::min(policy, bound.policy);
+                    for (const auto& part : bound.view.parts) {
+                        if (part.parent != sharded->parent || part.begin != end) {
+                            throw std::invalid_argument(first.name + ": parallel projection requires consecutive rows");
+                        }
+                        end = part.end;
+                    }
+                }
+                if (end != sharded->parent->geometry.elements) {
+                    throw std::invalid_argument(first.name + ": parallel projection must cover its encoded parent");
+                }
+                return {sharded->logical, policy, sharded};
+            }
+        }
         std::vector<ops::WeightInput> rows;
         for (const auto id : ids) { rows.push_back(input(id)); }
         return with_context(model_.weight(ids.front()).name,
@@ -73,6 +96,9 @@ public:
         const auto& bound = model_.weight(id);
         return with_context(bound.name, [&] {
             const auto& view = bound.view;
+            if (!view.parts.empty() && model_.parallel_weight(view.parts.front().parent)) {
+                throw std::invalid_argument("partitioned matrix cannot bind as a primary-device Tensor");
+            }
             if (view.shape.size() > 4) { throw std::invalid_argument("direct parameter exceeds Tensor rank"); }
             std::array<std::int32_t, 4> axes{1, 1, 1, 1};
             for (std::size_t i = 0; i < view.shape.size(); ++i) {
@@ -164,7 +190,9 @@ Parameters::Parameters(const Model& source) : model(source) {
     const auto& embedding = source.weight(w.token_embedding);
     token_embedding = with_context(embedding.name, [&] { return device_native_weight(embedding.view); });
     const auto& head = source.weight(w.output_head);
-    if (!head.view.parts.empty() && head.view.parts.front().parent->geometry.format == QType::Q8_G32_FP16) {
+    if (!head.view.parts.empty() && source.parallel_weight(head.view.parts.front().parent)) {
+        parallel_head = prepare.linear({w.output_head});
+    } else if (!head.view.parts.empty() && head.view.parts.front().parent->geometry.format == QType::Q8_G32_FP16) {
         output_head_q8 = prepare.linear({w.output_head});
     } else {
         output_head = prepare.tensor(w.output_head);
@@ -195,9 +223,40 @@ Parameters::Parameters(const Model& source) : model(source) {
                                           prepare.tensor(g.convolution),
                                           prepare.tensor(g.norm),
                                           prepare.linear({g.output})};
+            const auto& devices = source.options().parallel_devices;
+            if (!devices.empty()) {
+                auto& prepared = std::get<GdnParameters>(out.mixer);
+                const int C = c.gdn.conv_channels(), K = c.gdn.conv_kernel;
+                std::vector<std::uint16_t> full(std::size_t(C) * K);
+                CUDA_CHECK(cudaMemcpy(full.data(), prepared.convolution.data, full.size() * 2, cudaMemcpyDeviceToHost));
+                for (std::size_t rank = 0; rank < devices.size(); ++rank) {
+                    if (!pipeline_owns(i, rank, c.num_hidden_layers, devices.size(), source.options().pipeline_parallel)) { prepared.parallel_convolution.emplace_back(); continue; }
+                    const auto part = gdn_head_partition(c.gdn.key_heads, c.gdn.value_heads, rank, devices.size(), source.options().pipeline_parallel);
+                    const int kw = part.keys.count * c.gdn.key_head_dim, vw = part.values.count * c.gdn.value_head_dim;
+                    const int local_c = 2 * kw + vw, KW = c.gdn.key_width();
+                    std::vector<std::uint16_t> local(std::size_t(local_c) * K);
+                    for (int t = 0; t < K; ++t) {
+                        const auto* src = full.data() + t * C;
+                        auto* dst = local.data() + t * local_c;
+                        std::copy_n(src + part.keys.begin * c.gdn.key_head_dim, kw, dst);
+                        std::copy_n(src + KW + part.keys.begin * c.gdn.key_head_dim, kw, dst + kw);
+                        std::copy_n(src + 2 * KW + part.values.begin * c.gdn.value_head_dim, vw, dst + 2 * kw);
+                    }
+                    CUDA_CHECK(cudaSetDevice(devices[rank]));
+                    parallel_convolution_.emplace_back(local.size() * 2);
+                    parallel_convolution_.back().copy_from_host(local.data(), local.size() * 2);
+                    prepared.parallel_convolution.emplace_back(parallel_convolution_.back().p, DType::BF16,
+                                                               std::initializer_list<int>{local_c, K});
+                }
+                CUDA_CHECK(cudaSetDevice(devices.front()));
+            }
         }
-        out.moe.router         = prepare.tensor(layer.moe.router);
-        out.moe.shared_score   = prepare.tensor(layer.moe.shared_score);
+        if (!source.options().parallel_devices.empty()) {
+            out.moe.parallel_router = prepare.linear({layer.moe.router, layer.moe.shared_score});
+        } else {
+            out.moe.router = prepare.tensor(layer.moe.router);
+            out.moe.shared_score = prepare.tensor(layer.moe.shared_score);
+        }
         out.moe.shared_gate_up = prepare.linear({layer.moe.shared_gate, layer.moe.shared_up});
         out.moe.shared_down    = prepare.linear({layer.moe.shared_down});
         out.moe.bank           = &banks[i];
@@ -225,12 +284,17 @@ Parameters::Parameters(const Model& source) : model(source) {
         out.mlp_hc               = prepare.hc(m.mlp_hc);
         out.final_mixer          = prepare.hc(m.final_mixer);
         out.attention            = prepare.attention(m.attention);
-        out.router               = prepare.tensor(m.router);
-        out.shared_score         = prepare.tensor(m.shared_score);
+        if (!source.options().parallel_devices.empty()) {
+            out.parallel_router = prepare.linear({m.router, m.shared_score});
+        } else {
+            out.router = prepare.tensor(m.router);
+            out.shared_score = prepare.tensor(m.shared_score);
+        }
         out.shared_gate_up       = prepare.linear({m.shared_gate, m.shared_up});
         out.shared_down          = prepare.linear({m.shared_down});
-        out.experts_gate_up      = prepare.linear(m.expert_gate_up).weight;
-        out.experts_down         = prepare.linear(m.expert_down).weight;
+        const auto gate_up = prepare.linear(m.expert_gate_up), down = prepare.linear(m.expert_down);
+        out.experts_gate_up = gate_up.weight; out.experts_down = down.weight;
+        out.parallel_experts_gate_up = gate_up.parallel; out.parallel_experts_down = down.parallel;
         mtp = std::move(out);
     }
     if (w.proposal) {

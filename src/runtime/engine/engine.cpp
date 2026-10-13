@@ -1,6 +1,7 @@
 #include "infernix/engine.h"
 
 #include "core/device.h"
+#include "core/parallel_partition.h"
 #include "core/nvtx.h"
 #include "core/power_throttling.h"
 #include "core/startup.h"
@@ -257,11 +258,26 @@ public:
     // hybrid prefix cache's) need the artifact's architecture, read once here. An unreadable
     // artifact is reported by the (Qwen3.5) model construction, after option validation.
     EngineOptions normalize(EngineOptions engine_options) {
+        validate_parallel_devices(engine_options.parallel_devices, engine_options.device);
+        if (engine_options.fixed_kv_owners && (engine_options.parallel_devices.size() != 4 || engine_options.pipeline_parallel)) {
+            throw std::invalid_argument("--fixed-kv-owners requires four --parallel-devices without --pipeline-parallel");
+        }
+        if (engine_options.pipeline_parallel && engine_options.parallel_devices.size() != 4) {
+            throw std::invalid_argument("--pipeline-parallel requires four --parallel-devices");
+        }
         try {
             if (runtime::artifact_is_qwen4_exp(engine_options.artifact_path)) {
                 architecture = models::Architecture::Qwen4Exp;
             }
         } catch (const std::exception&) {}
+        if (!engine_options.parallel_devices.empty() && architecture != models::Architecture::Qwen4Exp) {
+            throw std::invalid_argument("--parallel-devices currently supports Qwen3.8-Flash-Next (Qwen4Exp) only");
+        }
+#ifdef _WIN32
+        if (!engine_options.parallel_devices.empty()) {
+            throw std::invalid_argument("--parallel-devices currently supports Linux only");
+        }
+#endif
         runtime::validate_engine_options(engine_options, architecture);
         return runtime::normalize_engine_options(std::move(engine_options), architecture);
     }

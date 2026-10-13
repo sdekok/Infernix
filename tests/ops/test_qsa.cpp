@@ -66,8 +66,11 @@ constexpr int kDi               = 128; // index head dimension
 constexpr int kR                = 4;   // tokens per pooled block
 constexpr int kPage             = 64;  // positions per KV page
 constexpr int kD                = 256; // attention head dimension
-constexpr int kHeads            = 24;
-constexpr int kKvHeads          = 2;
+#ifndef INFERNIX_QSA_KV_HEADS
+#define INFERNIX_QSA_KV_HEADS 2
+#endif
+constexpr int kKvHeads          = INFERNIX_QSA_KV_HEADS;
+constexpr int kHeads            = 12 * kKvHeads;
 constexpr int kIndexHeads       = 4;
 constexpr int kRotary           = 64;
 constexpr int kBudget           = 2048;
@@ -1019,9 +1022,15 @@ void test_vq_attention(KvCacheStorage storage, const VqCase& c, std::uint32_t se
     const std::size_t workspace_bytes = ops::qsa_attention_workspace_bytes(kGeometry, columns, max_context, storage);
     DeviceBuffer workspace(workspace_bytes), dout(static_cast<std::size_t>(kD) * kHeads * columns * 2);
     Tensor out(dout.p, DType::BF16, {kD, kHeads, columns});
+    DeviceBuffer selected(std::size_t(kTopBlocks) * columns * 4), counts(std::size_t(columns) * 4),
+        select_work(ops::qsa_selection_workspace_bytes(kGeometry, columns, max_context));
+    ops::QsaSelection selection{Tensor(selected.p, DType::I32, {kTopBlocks, columns}),
+        Tensor(counts.p, DType::I32, {columns})};
+    ops::qsa_select_blocks(Tensor(diq.p, DType::BF16, {kDi, kIndexHeads, columns}), layer, batch,
+        kGeometry, max_context, select_work.p, select_work.bytes, selection, nullptr);
     ops::qsa_attention(Tensor(dq.p, DType::BF16, {kD, kHeads, columns}),
                        Tensor(diq.p, DType::BF16, {kDi, kIndexHeads, columns}), layer, batch, kGeometry, 1.0F / 16.0F,
-                       max_context, workspace.p, workspace_bytes, out, nullptr, &append);
+                       max_context, workspace.p, workspace_bytes, out, nullptr, &append, &selection);
     synchronize("vq attention");
     const auto got = t::from_device_bf16(dout, static_cast<std::size_t>(kD) * kHeads * columns);
     // The stored state after the call: paged rows, and the window holding the call's exact rows.
@@ -1175,10 +1184,16 @@ void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_
     DeviceBuffer workspace(workspace_bytes),
         dout(static_cast<std::size_t>(kD) * kHeads * columns * 2);
     Tensor out(dout.p, DType::BF16, {kD, kHeads, columns});
+    DeviceBuffer selected(std::size_t(kTopBlocks) * columns * 4), counts(std::size_t(columns) * 4),
+        select_work(ops::qsa_selection_workspace_bytes(kGeometry, columns, max_context));
+    ops::QsaSelection selection{Tensor(selected.p, DType::I32, {kTopBlocks, columns}),
+        Tensor(counts.p, DType::I32, {columns})};
+    ops::qsa_select_blocks(Tensor(diq.p, DType::BF16, {kDi, kIndexHeads, columns}), layer, batch,
+        kGeometry, max_context, select_work.p, select_work.bytes, selection, nullptr);
     ops::qsa_attention(Tensor(dq.p, DType::BF16, {kD, kHeads, columns}),
                        Tensor(diq.p, DType::BF16, {kDi, kIndexHeads, columns}), layer, batch,
                        kGeometry, 1.0F / 16.0F, max_context, workspace.p, workspace_bytes, out,
-                       nullptr);
+                       nullptr, nullptr, &selection);
     synchronize("attention");
     const auto got = t::from_device_bf16(dout, static_cast<std::size_t>(kD) * kHeads * columns);
     const std::string tag = std::string("qsa_attention ") + storage_name(storage) + " " + c.name;
@@ -1368,12 +1383,31 @@ void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (t::cuda_unavailable()) {
         std::printf("SKIP: no usable CUDA device\n");
         return 77;
     }
     try {
+        if (argc == 2 && std::string(argv[1]) == "--multi-device") {
+            int devices = 0;
+            t::cuda_check(cudaGetDeviceCount(&devices), "device count");
+            if (devices < 2) { return 77; }
+            for (int device = 0; device < std::min(devices, 4); ++device) {
+                t::cuda_check(cudaSetDevice(device), "select attention owner");
+                std::printf("Attention owner GPU %d\n", device);
+                for (const auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+                        KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+                    test_attention(storage, {"owner decode", 1, {2050, 3100}}, 91);
+                    test_attention(storage, {"owner prompt", 64, {3000}}, 92);
+                }
+                for (const auto storage : {KvCacheStorage::Vq2, KvCacheStorage::Q4KeyVq2Value}) {
+                    test_vq_attention(storage, {"owner decode window", 1, {3000}, true}, 93);
+                    test_vq_attention(storage, {"owner prompt window", 64, {3000}, true}, 94);
+                }
+            }
+            return g_failures == 0 ? 0 : 1;
+        }
         for (const int columns : {1, 5, 64, 1024}) { test_index_query(columns, 100U + columns); }
         test_pool(7);
         // Under YaRN (factor 4 over an original span of 4096, so the ramp falls inside the rotary

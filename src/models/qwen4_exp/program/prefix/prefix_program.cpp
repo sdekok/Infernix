@@ -43,11 +43,12 @@ void ProgramImpl::create_prefix_cache() {
     lane_image_      = std::make_unique<prefix::LaneStateImage>(
         image_layout_,
         prefix::LaneStateBuffers{.gdn       = gdn_.get(),
+                                 .gdn_shards = parallel_gdn_ ? std::span<const execution::GdnStateShard>(parallel_gdn_->shards) : std::span<const execution::GdnStateShard>{},
                                  .lanes     = lanes,
                                  .ple       = static_cast<std::byte*>(ple_backing_.p),
                                  .tails     = static_cast<std::byte*>(tails_backing_.p),
                                  .mtp_saved = mtp_ ? static_cast<std::byte*>(mtp_saved_.p) : nullptr,
-                                 .window    = static_cast<std::byte*>(window_backing_.p),
+                                 .window    = static_cast<std::byte*>(window_base()),
                                  .window_geometry = window_geometry_});
     prefix::PrefixCacheConfig config;
     config.index.cost = options_.prefix_cost;

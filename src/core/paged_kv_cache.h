@@ -74,6 +74,8 @@ struct KVPlaneGeometry {
     std::int32_t leading_extent = 0;
     std::int32_t head_extent    = 0;
     std::size_t alignment       = 256;
+    // Per-head allocation alignment for independently backed HeadMajor planes.
+    std::size_t head_alignment  = 1;
 
     friend bool operator==(const KVPlaneGeometry&, const KVPlaneGeometry&) = default;
 };

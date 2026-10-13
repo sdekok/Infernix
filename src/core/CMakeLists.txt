@@ -12,6 +12,7 @@ add_library(infernix_core STATIC
   evictable_weight_pool.cu
   vmm_arena.cu
   device.cu
+  peer_copy.cu
   direct_read_queue.cpp
   dtype.cpp
   host_memory.cpp

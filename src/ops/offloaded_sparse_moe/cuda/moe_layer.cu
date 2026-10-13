@@ -12,6 +12,7 @@
 #include "infernix/ops/offloaded_sparse_moe.h"
 
 #include "core/device.h"
+#include "core/cuda_function_attributes.h"
 #include "core/pdl.cuh"
 
 #include "ops/common/canonical_math.h"
@@ -558,7 +559,7 @@ __device__ __forceinline__ void dispatch_scan(int c, int experts, std::int32_t* 
 // route below.
 __global__ void __launch_bounds__(kDispatchThreads)
     dispatch_small_kernel(const std::int32_t* __restrict__ ids, int entries, int experts, MoeDispatch dispatch,
-                          std::int32_t* __restrict__ route_log) {
+                          std::int32_t* __restrict__ route_log, int rank, int ranks, const std::int32_t* owners) {
     __shared__ std::int32_t count[kDispatchThreads];
     __shared__ std::int32_t cursor[kDispatchThreads];
     __shared__ std::int32_t warp_totals[2][kDispatchThreads / 32];
@@ -567,7 +568,7 @@ __global__ void __launch_bounds__(kDispatchThreads)
     __syncthreads();
     const int id = i < entries ? ids[i] : 0;
     if (i < entries) {
-        atomicAdd(&count[id], 1);
+        if ((owners ? owners[id] : id % ranks) == rank) { atomicAdd(&count[id], 1); }
         if (route_log != nullptr) { route_log[i] = id; }
     }
     __syncthreads();
@@ -575,15 +576,16 @@ __global__ void __launch_bounds__(kDispatchThreads)
     if (i < experts) { dispatch.counts[i] = c; }
     dispatch_scan(c, experts, dispatch.offsets, cursor, dispatch.jobs, dispatch.job_count, warp_totals);
     __syncthreads();
-    if (i < entries) { dispatch.entries[atomicAdd(&cursor[id], 1)] = i; }
+    if (i < entries && (owners ? owners[id] : id % ranks) == rank) { dispatch.entries[atomicAdd(&cursor[id], 1)] = i; }
 }
 
 __global__ void count_kernel(const std::int32_t* __restrict__ ids, int entries,
-                             std::int32_t* __restrict__ counts, std::int32_t* __restrict__ route_log) {
+                             std::int32_t* __restrict__ counts, std::int32_t* __restrict__ route_log,
+                             int rank, int ranks, const std::int32_t* owners) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < entries) {
         const int id = ids[i];
-        atomicAdd(&counts[id], 1);
+        if ((owners ? owners[id] : id % ranks) == rank) { atomicAdd(&counts[id], 1); }
         if (route_log != nullptr) { route_log[i] = id; }
     }
 }
@@ -599,9 +601,10 @@ __global__ void __launch_bounds__(kDispatchThreads)
 }
 
 __global__ void scatter_kernel(const std::int32_t* __restrict__ ids, int entries,
-                               std::int32_t* __restrict__ cursor, std::int32_t* __restrict__ out) {
+                               std::int32_t* __restrict__ cursor, std::int32_t* __restrict__ out,
+                               int rank, int ranks, const std::int32_t* owners) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < entries) { out[atomicAdd(&cursor[ids[i]], 1)] = i; }
+    if (i < entries && (owners ? owners[ids[i]] : ids[i] % ranks) == rank) { out[atomicAdd(&cursor[ids[i]], 1)] = i; }
 }
 
 // --------------------------------------------------------------------------------------- experts
@@ -881,15 +884,8 @@ void launch_expert_pass(const bf16* x, const MoeDispatch& dispatch, const MoeExp
                         const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                         canon::A4Block* h_blocks, int columns_out, bf16* outputs, cudaStream_t stream,
                         PassPhase phase = PassPhase::All) {
-    static const bool configured = [] {
-        cudaFuncSetAttribute(gate_up_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(sizeof(GateUpShared)));
-        cudaFuncSetAttribute(down_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(sizeof(DownShared)));
-        cudaFuncSetAttribute(gate_up_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-        cudaFuncSetAttribute(down_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-        return true;
-    }();
-    (void)configured;
+    prepare_cuda_shared<gate_up_kernel>(sizeof(GateUpShared), true);
+    prepare_cuda_shared<down_kernel>(sizeof(DownShared), true);
     gate_up_kernel<<<dim3(kGateUpCtas, jobs), kThreads, sizeof(GateUpShared), stream>>>(
         x, moe::kHidden, dispatch, source, top_k, job_records, flags, base, h_blocks, phase);
     check_launch("gate/up");
@@ -1172,18 +1168,8 @@ void launch_expert_pass_a16(const bf16* x, const MoeDispatch& dispatch, const Mo
                             const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                             std::uint16_t* h_plane, bf16* outputs, cudaStream_t stream,
                             PassPhase phase = PassPhase::All) {
-    static const bool configured = [] {
-        cudaFuncSetAttribute(gate_up_kernel_a16<Columns>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(sizeof(GateUpShared16<Columns>)));
-        cudaFuncSetAttribute(down_kernel_a16<Columns>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(sizeof(DownShared16<Columns>)));
-        cudaFuncSetAttribute(gate_up_kernel_a16<Columns>, cudaFuncAttributePreferredSharedMemoryCarveout,
-                             cudaSharedmemCarveoutMaxShared);
-        cudaFuncSetAttribute(down_kernel_a16<Columns>, cudaFuncAttributePreferredSharedMemoryCarveout,
-                             cudaSharedmemCarveoutMaxShared);
-        return true;
-    }();
-    (void)configured;
+    prepare_cuda_shared<gate_up_kernel_a16<Columns>>(sizeof(GateUpShared16<Columns>), true);
+    prepare_cuda_shared<down_kernel_a16<Columns>>(sizeof(DownShared16<Columns>), true);
     gate_up_kernel_a16<Columns><<<dim3(kGateUpCtas, jobs), kThreads, sizeof(GateUpShared16<Columns>), stream>>>(
         x, moe::kHidden, dispatch, source, top_k, job_records, flags, base, h_plane, phase);
     check_launch("A16 gate/up");
@@ -1524,6 +1510,29 @@ __global__ void combine_kernel(const bf16* __restrict__ outputs, const float* __
     y[static_cast<std::size_t>(t) * hidden + d] = __float2bfloat16_rn(sum);
 }
 
+__global__ void combine_owner_kernel(const bf16* outputs, const float* weights, const std::int32_t* ids,
+    int hidden, int top_k, int columns, int owner, int owners, const std::int32_t* owner_table, float* partial) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (d >= hidden || t >= columns) { return; }
+    float sum = 0;
+    for (int k = 0; k < top_k; ++k) {
+        const auto entry = std::size_t(t) * top_k + k; const int id = ids[entry];
+        if ((owner_table ? owner_table[id] : id % owners) == owner) {
+            sum += weights[entry] * __bfloat162float(outputs[entry * hidden + d]);
+        }
+    }
+    partial[std::size_t(t) * hidden + d] = sum;
+}
+__global__ void combine_partials_kernel(const float* partials, const float* shared_gate, const bf16* shared,
+    int hidden, int columns, int owners, bf16* y) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (d >= hidden || t >= columns) { return; }
+    const auto at = std::size_t(t) * hidden + d;
+    float sum = 0;
+    for (int r = 0; r < owners; ++r) { sum += partials[std::size_t(r) * hidden * columns + at]; }
+    sum += shared_gate[t] * __bfloat162float(shared[at]); y[at] = __float2bfloat16_rn(sum);
+}
+
 } // namespace
 
 void moe_route(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, cudaStream_t stream) {
@@ -1563,26 +1572,28 @@ MoeDispatch carve_moe_dispatch(void* base, std::int32_t experts, std::int32_t en
 }
 
 void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& dispatch,
-                  std::int32_t* route_log, cudaStream_t stream) {
+                  std::int32_t* route_log, cudaStream_t stream, int owner_rank, int owner_count, const std::int32_t* owners) {
     require(experts > 0 && experts <= kDispatchThreads, "dispatch supports up to 1024 experts");
+    require(owner_count > 0 && owner_rank >= 0 && owner_rank < owner_count, "invalid expert owner");
     const int entries = static_cast<int>(routing.ids.numel());
     const auto* ids   = static_cast<const std::int32_t*>(routing.ids.data);
     if (entries <= kDispatchThreads) {
         // Decode and verification widths (k * T <= 1024): one kernel and no memset node.
-        dispatch_small_kernel<<<1, kDispatchThreads, 0, stream>>>(ids, entries, experts, dispatch, route_log);
+        dispatch_small_kernel<<<1, kDispatchThreads, 0, stream>>>(ids, entries, experts, dispatch, route_log,
+                                                                 owner_rank, owner_count, owners);
         check_launch("dispatch");
         return;
     }
     require(cudaMemsetAsync(dispatch.counts, 0, sizeof(std::int32_t) * experts, stream) == cudaSuccess,
             "dispatch could not clear its counts");
     count_kernel<<<(entries + kThreads - 1) / kThreads, kThreads, 0, stream>>>(ids, entries, dispatch.counts,
-                                                                                route_log);
+                                                                                route_log, owner_rank, owner_count, owners);
     check_launch("count");
     scan_kernel<<<1, kDispatchThreads, 0, stream>>>(dispatch.counts, experts, dispatch.offsets, dispatch.cursor,
                                                     dispatch.jobs, dispatch.job_count);
     check_launch("scan");
     scatter_kernel<<<(entries + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-        ids, entries, dispatch.cursor, dispatch.entries);
+        ids, entries, dispatch.cursor, dispatch.entries, owner_rank, owner_count, owners);
     check_launch("scatter");
 }
 
@@ -1775,6 +1786,33 @@ void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor&
         static_cast<const float*>(routing.shared_gate.data), static_cast<const bf16*>(shared.data),
         hidden, top_k, columns, static_cast<bf16*>(y.data));
     check_launch("combine");
+}
+
+void moe_combine_owner(const Tensor& outputs, const MoeRouting& routing, int owner, int owners,
+                       Tensor& partial, cudaStream_t stream, const std::int32_t* owner_table) {
+    require(owners >= 1 && owners <= 4 && owner >= 0 && owner < owners, "invalid partial owner");
+    require(contiguous(outputs, DType::BF16) && contiguous(routing.ids, DType::I32) &&
+        contiguous(routing.weights, DType::FP32) && contiguous(partial, DType::FP32), "partial tensor types");
+    const int H = partial.ne[0], T = partial.ne[1], K = routing.ids.ne[0];
+    require(H > 0 && T > 0 && K > 0 && K <= 16 && outputs.ne[0] == H && outputs.ne[1] == K * T &&
+        routing.ids.ne[1] == T && routing.weights.ne[0] == K && routing.weights.ne[1] == T, "partial shapes");
+    combine_owner_kernel<<<dim3((H + kThreads - 1) / kThreads, T), kThreads, 0, stream>>>(
+        static_cast<const bf16*>(outputs.data), static_cast<const float*>(routing.weights.data),
+        static_cast<const std::int32_t*>(routing.ids.data), H, K, T, owner, owners, owner_table,
+        static_cast<float*>(partial.data));
+    check_launch("combine owner");
+}
+void moe_combine_partials(const Tensor& partials, const MoeRouting& routing, const Tensor& shared,
+                          Tensor& y, cudaStream_t stream) {
+    require(contiguous(partials, DType::FP32) && contiguous(shared, DType::BF16) && contiguous(y, DType::BF16) &&
+        contiguous(routing.shared_gate, DType::FP32), "partial combine tensor types");
+    const int H = y.ne[0], T = y.ne[1], R = partials.ne[2];
+    require(H > 0 && T > 0 && R >= 1 && R <= 4 && partials.ne[0] == H && partials.ne[1] == T &&
+        shared.ne[0] == H && shared.ne[1] == T && routing.shared_gate.numel() == T, "partial combine shapes");
+    combine_partials_kernel<<<dim3((H + kThreads - 1) / kThreads, T), kThreads, 0, stream>>>(
+        static_cast<const float*>(partials.data), static_cast<const float*>(routing.shared_gate.data),
+        static_cast<const bf16*>(shared.data), H, T, R, static_cast<bf16*>(y.data));
+    check_launch("combine partials");
 }
 
 } // namespace infernix::ops

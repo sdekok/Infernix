@@ -1,0 +1,1229 @@
+--- a/src/models/qwen4_exp/execution/expert_stream.cpp
++++ b/src/models/qwen4_exp/execution/expert_stream.cpp
+@@ -50,7 +50,9 @@
+     return static_cast<std::uint32_t>((bytes - tables) / stride_) & ~1U;
+ }
+ 
+-void ExpertStream::begin(DeviceSpan ring, const std::int32_t* residency, cudaStream_t compute, bool gated) {
++void ExpertStream::begin(DeviceSpan ring, const std::int32_t* residency, cudaStream_t compute, bool gated, std::uint32_t first, std::uint32_t end) {
++    first_ = first; end_ = std::min(end, layers_);
++    if (first_ >= end_) { throw std::invalid_argument("empty streamed layer range"); }
+     if (active_) { throw std::logic_error("expert stream: a chunk is already streaming"); }
+     const std::uint32_t slots = slots_in(ring.bytes);
+     if (slots < 2 || ring.data == nullptr) { throw std::invalid_argument("expert stream: the ring holds no slots"); }
+@@ -78,7 +80,7 @@
+         const std::int32_t* frames = residency + static_cast<std::size_t>(l) * experts_;
+         std::uint32_t taken = 0;
+         for (std::uint32_t e = 0; e < experts_; ++e) {
+-            const bool stream = frames[e] < 0 && taken < half_ && record_of_(l, e) != nullptr;
++            const bool stream = l >= first_ && l < end_ && frames[e] < 0 && taken < half_ && record_of_(l, e) != nullptr;
+             row[e]            = stream ? static_cast<std::int32_t>((l % 2) * half_ + taken++) : -1;
+             if (stream && hold_) { hold_(l, e); }
+         }
+@@ -92,8 +94,8 @@
+     CUDA_CHECK(cudaEventRecord(start_, compute));
+     CUDA_CHECK(cudaStreamWaitEvent(stream_, start_, 0));
+     active_ = true;
+-    enqueue(0);
+-    if (layers_ > 1) { enqueue(1); }
++    enqueue(first_);
++    if (first_ + 1 < end_) { enqueue(first_ + 1); }
+ }
+ 
+ std::uint32_t ExpertStream::plan_layer(std::uint32_t layer, std::span<const std::int32_t> columns,
+@@ -114,7 +116,7 @@
+     streams_[layer] = 1; // the MoE waits for the table upload even when nothing is copied
+     // The half's previous readers (layer - 2's experts) release it first; the table rides ahead of
+     // the copies on the copy stream, so the layer's landed event covers both.
+-    if (layer >= 2) { CUDA_CHECK(cudaStreamWaitEvent(stream_, consumed_[layer - 2], 0)); }
++    if (layer >= first_ + 2) { CUDA_CHECK(cudaStreamWaitEvent(stream_, consumed_[layer - 2], 0)); }
+     CUDA_CHECK(cudaMemcpyAsync(tables_ + static_cast<std::size_t>(layer) * experts_, row, experts_ * sizeof(std::int32_t),
+                                cudaMemcpyHostToDevice, stream_));
+     enqueue(layer);
+@@ -126,7 +128,7 @@
+ }
+ 
+ void ExpertStream::enqueue(std::uint32_t layer) {
+-    if (layer >= 2) { CUDA_CHECK(cudaStreamWaitEvent(stream_, consumed_[layer - 2], 0)); }
++    if (layer >= first_ + 2) { CUDA_CHECK(cudaStreamWaitEvent(stream_, consumed_[layer - 2], 0)); }
+     const auto* row = static_cast<const std::int32_t*>(tables_host_.data()) + static_cast<std::size_t>(layer) * experts_;
+     // Runs of consecutive experts in consecutive slots and adjacent records of one allocation: one
+     // copy per run (a copy may not span two pinned allocations, even adjacent ones), all enqueued as
+@@ -160,7 +162,7 @@
+ void ExpertStream::after_experts(std::uint32_t layer, cudaStream_t compute) {
+     if (!active_) { return; }
+     CUDA_CHECK(cudaEventRecord(consumed_[layer], compute));
+-    if (!gated_ && layer + 2 < layers_) { enqueue(layer + 2); }
++    if (!gated_ && layer + 2 < end_) { enqueue(layer + 2); }
+ }
+ 
+ } // namespace infernix::models::qwen4_exp::execution
+--- a/src/models/qwen4_exp/execution/expert_stream.h
++++ b/src/models/qwen4_exp/execution/expert_stream.h
+@@ -60,7 +60,7 @@
+     // frame or -1, as the chunk's kernels see them). On `compute`: uploads the slot tables; on the
+     // copy stream, behind `compute`'s work so far, the copies of layers 0 and 1.
+     // `gated`: no copies now; plan_layer enqueues each layer's.
+-    void begin(DeviceSpan ring, const std::int32_t* residency, cudaStream_t compute, bool gated = false);
++    void begin(DeviceSpan ring, const std::int32_t* residency, cudaStream_t compute, bool gated = false, std::uint32_t first = 0, std::uint32_t end = UINT32_MAX);
+     // A gated chunk's layer `layer`, in layer order: copies (and the slot table of) every expert with
+     // columns[e] > 0 that is not resident and has cpu[e] == 0, up to the layer's half, behind the
+     // release of layer - 2's half. Returns how many it copies.
+@@ -90,7 +90,7 @@
+ private:
+     void enqueue(std::uint32_t layer);
+ 
+-    std::uint32_t experts_ = 0, layers_ = 0;
++    std::uint32_t experts_ = 0, layers_ = 0, first_ = 0, end_ = 0;
+     std::uint64_t stride_  = 0;
+     RecordOf record_of_;
+     Hold hold_;
+--- a/src/models/qwen4_exp/execution/forward.cpp
++++ b/src/models/qwen4_exp/execution/forward.cpp
+@@ -1,5 +1,6 @@
+ #include "models/qwen4_exp/execution/forward.h"
+ #include "models/qwen4_exp/execution/parallel.h"
++#include "models/qwen4_exp/head_partition.h"
+ 
+ #include "infernix/ops/causal_conv1d_silu.h"
+ #include "infernix/ops/embedding.h"
+@@ -100,7 +101,7 @@
+       state_(std::move(state)), kv_(std::move(kv)), experts_(std::move(experts)), max_context_(max_context),
+       rope_(ops::prepare_rope(dim(config_.rope.rotary_dim), config_.rope.theta,
+                               {config_.rope.yarn_factor, config_.max_position_embeddings})) {
+-    if (state_.gdn == nullptr || state_.gdn->layer_count() != config_.gdn_layers ||
++    if (state_.gdn == nullptr || (!state_.parallel_gdn && state_.gdn->layer_count() != config_.gdn_layers) ||
+         state_.qsa_tails.size() != config_.attention_layers || kv_.layers.size() != config_.attention_layers ||
+         experts_.frames.size() != config_.num_hidden_layers) {
+         throw std::invalid_argument("Qwen4Exp forward: state, KV or expert residency is incomplete");
+@@ -575,10 +576,11 @@
+             cudaSuccess) {
+         throw std::runtime_error("Qwen4Exp forward: route tap copy failed");
+     }
++    const bool root_owns = !experts_.parallel || pipeline_owns(layer, 0, config_.num_hidden_layers, experts_.parallel->size());
+     const DeviceSpan dispatch_bytes = work_.alloc_bytes(ops::moe_dispatch_bytes(E, K * T));
+     ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E, K * T);
+     const int owners = experts_.parallel ? experts_.parallel->size() : 1;
+-    ops::moe_dispatch(routing, E, dispatch, route_log, s, 0, owners);
++    ops::moe_dispatch(routing, E, dispatch, route_log, s, 0, owners, experts_.parallel ? experts_.parallel->expert_owners(layer) : nullptr);
+     if (experts_.parallel) {
+         experts_.parallel->begin_experts(layer, x, routing, batch && batch->stream, batch && batch->release_stream);
+     }
+@@ -598,10 +600,10 @@
+     }
+     source.error = experts_.error;
+     // Prefill chunks (one sequence of many positions, run eagerly) overlap staging with compute.
+-    if (eager_chunk_ && experts_.overlap_stream != nullptr) {
++    if (root_owns && eager_chunk_ && experts_.overlap_stream != nullptr) {
+         source.overlap_stream = experts_.overlap_stream;
+         for (int i = 0; i < 5; ++i) { source.overlap_events[i] = experts_.overlap_events[static_cast<std::size_t>(i)]; }
+-    } else if (experts_.overlap_stream != nullptr) {
++    } else if (root_owns && experts_.overlap_stream != nullptr) {
+         // Decode and verification calls (one pass, possibly graph-captured): resident experts
+         // compute while the misses stage on the same side stream.
+         source.fork_stream    = experts_.overlap_stream;
+@@ -635,7 +637,7 @@
+         }
+     }
+     // A streamed prefill chunk: the layer's copied-ahead experts are read from the ring.
+-    ExpertStream* const streaming = eager_chunk_ && batch != nullptr && batch->stream && experts_.stream != nullptr &&
++    ExpertStream* const streaming = root_owns && eager_chunk_ && batch != nullptr && batch->stream && experts_.stream != nullptr &&
+                                             experts_.stream->active()
+                                         ? experts_.stream
+                                         : nullptr;
+@@ -676,7 +678,8 @@
+     const std::int32_t max_jobs = std::min(E, K * T);
+     const DeviceSpan expert_ws  = work_.alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T, T, source.activation));
+     // The shared expert runs while the host computes the CPU-served misses.
+-    ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false);
++    // The second stage has no primary-owned experts; its peers fill every output slot.
++    if (root_owns) { ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false); }
+     if (streaming != nullptr && batch->release_stream) { streaming->after_experts(layer, s); }
+ 
+     const std::int32_t I = dim(m.shared_intermediate);
+@@ -684,8 +687,8 @@
+     shared_swiglu(x, p.shared_gate_up, product, work_, s);
+     Tensor shared = work_.alloc(DType::BF16, {H, T});
+     project(product, p.shared_down, shared, work_, s);
+-    ops::moe_experts_cpu_wait(x, dispatch, source, max_jobs, expert_ws.data, outputs, s);
+-    if (experts_.parallel) { experts_.parallel->finish_experts(routing, outputs); }
++    if (root_owns) { ops::moe_experts_cpu_wait(x, dispatch, source, max_jobs, expert_ws.data, outputs, s); }
++    if (experts_.parallel) { experts_.parallel->finish_experts(layer, routing, outputs); }
+     Tensor y = work_.alloc(DType::BF16, {H, T});
+     ops::moe_combine(outputs, routing, shared, y, s);
+     return y;
+--- a/src/models/qwen4_exp/execution/parallel.cpp
++++ b/src/models/qwen4_exp/execution/parallel.cpp
+@@ -105,6 +105,8 @@
+     ExpertResidency* primary_cache = nullptr;
+     bool wide_active = false;
+     std::vector<std::unique_ptr<Rank>> ranks;
++    std::unique_ptr<Rank> pipeline_root;
++    cudaStream_t pipeline_stream = nullptr;
+     static constexpr int staging_slots = 32;
+     // Fused HC only serves T <= 16, rank <= 512, four residual streams.
+     static constexpr std::size_t hc_bytes = 4 * 528 * 16 * sizeof(float);
+@@ -217,7 +219,22 @@
+             rank.wide_bytes += align(rank.wide_workspace_bytes);
+             rank.hc_norm = DeviceBuffer(std::size_t(c.residual_width()) * 2);
+             rank.hc_partials = DeviceBuffer(hc_bytes); rank.hc_inverse = DeviceBuffer(4 * 16 * sizeof(float));
+-            if (i == 0) { rank.hc_gathered = DeviceBuffer(hc_bytes); continue; }
++            if (i == 0) {
++                rank.hc_gathered = DeviceBuffer(hc_bytes);
++                pipeline_root = std::make_unique<Rank>(); auto& aux = *pipeline_root; aux.device = &primary;
++                CUDA_CHECK(cudaStreamCreateWithFlags(&pipeline_stream, cudaStreamNonBlocking));
++                CUDA_CHECK(cudaEventCreateWithFlags(&aux.start, cudaEventDisableTiming));
++                CUDA_CHECK(cudaEventCreateWithFlags(&aux.done, cudaEventDisableTiming));
++                CUDA_CHECK(cudaEventCreateWithFlags(&aux.experts_done, cudaEventDisableTiming));
++                CUDA_CHECK(cudaEventCreateWithFlags(&aux.gdn_projected, cudaEventDisableTiming));
++                CUDA_CHECK(cudaEventCreateWithFlags(&aux.broadcast_ready, cudaEventDisableTiming));
++                aux.input = DeviceBuffer(rank.input.bytes); aux.output = DeviceBuffer(rank.output.bytes);
++                aux.workspace = std::make_unique<WorkspaceArena>(workspace_bytes(columns));
++                aux.state_work = std::make_unique<WorkspaceArena>(state_bytes(columns));
++                aux.hc_norm = DeviceBuffer(rank.hc_norm.bytes); aux.hc_partials = DeviceBuffer(hc_bytes);
++                aux.hc_inverse = DeviceBuffer(4 * 16 * sizeof(float)); aux.hc_gathered = DeviceBuffer(hc_bytes);
++                continue;
++            }
+             rank.expert_scales = DeviceBuffer(std::size_t(c.num_hidden_layers) * c.moe.experts * sizeof(ops::offloaded_moe::ExpertScales));
+             rank.staging = DeviceBuffer(stride * staging_slots);
+             std::vector<const std::uint8_t*> banks;
+@@ -232,7 +249,7 @@
+             for (int reader : devices) { rank.cache->allow_peer_access(reader); }
+             rank.prefill_stream = std::make_unique<ExpertStream>(c.num_hidden_layers, c.moe.experts, stride,
+                 [this, i, stride](std::uint32_t layer, std::uint32_t expert) -> const std::uint8_t* {
+-                    if (expert % ranks.size() != i) { return nullptr; }
++                    if (parallel_expert_owner(layer, expert, parameters.model.config().text.moe.experts, parameters.model.config().text.num_hidden_layers, ranks.size()) != int(i)) { return nullptr; }
+                     const auto* bank = parameters.layers.at(layer).moe.bank;
+                     return reinterpret_cast<const std::uint8_t*>(bank->planes.device_records) + expert * stride;
+                 }, true);
+@@ -249,7 +266,7 @@
+             rank.device->synchronize();
+         }
+     }
+-    ~Impl() { for (auto& rank : ranks) { rank.reset(); } primary.bind_to_current_thread_noexcept(); }
++    ~Impl() { primary.bind_to_current_thread_noexcept(); if (pipeline_stream) { (void)cudaStreamSynchronize(pipeline_stream); } pipeline_root.reset(); if (pipeline_stream) { (void)cudaStreamDestroy(pipeline_stream); } for (auto& rank : ranks) { rank.reset(); } primary.bind_to_current_thread_noexcept(); }
+     bool distributed_broadcast(const Tensor& x) const { return ranks.size() > 2 && x.bytes() >= (1ULL << 20); }
+     void start(const Tensor* x = nullptr, const PartitionedWeight* weight = nullptr) {
+         primary.bind_to_current_thread(); CUDA_CHECK(cudaEventRecord(ranks.front()->start, primary.stream));
+@@ -422,7 +439,7 @@
+     const auto& c = p.parameters.model.config().text;
+     // A full pair of owned layers guarantees every peer miss is streamed,
+     // including experts evicted by the loan itself. Tables occupy one frame.
+-    const auto frames = 2 * ((c.moe.experts + size() - 1) / size()) + 1;
++    const auto frames = c.moe.experts + 1;
+     for (int i = 1; i < size(); ++i) {
+         auto& r = *p.ranks[i]; r.device->bind_to_current_thread();
+         if (r.prefill_lease.valid()) { throw std::logic_error("parallel prefill stream already active"); }
+@@ -431,10 +448,28 @@
+         const cudaStream_t writers[] = {r.prefill_stream->stream()};
+         r.prefill_lease = r.cache->lend(frames, r.device->stream, writers);
+         r.prefill_streamed_before = r.prefill_stream->stats().streamed;
+-        r.prefill_stream->begin(r.prefill_lease.memory, r.cache->host_table(), r.device->stream);
++        r.prefill_stream->begin(r.prefill_lease.memory, r.cache->host_table(), r.device->stream, false, pipeline_first(i, c.num_hidden_layers, size()), pipeline_first(i, c.num_hidden_layers, size()) + pipeline_layers(c.num_hidden_layers, size()));
+     }
+ }
+ 
++void ParallelExecution::switch_pipeline_stage() {
++    auto& p = *impl_; p.primary.bind_to_current_thread();
++    std::swap(p.primary.stream, p.pipeline_stream); std::swap(p.ranks[0], p.pipeline_root);
++}
++void ParallelExecution::synchronize_pipeline() {
++    auto& p = *impl_; p.primary.bind_to_current_thread();
++    if (p.pipeline_stream) { CUDA_CHECK(cudaStreamSynchronize(p.pipeline_stream)); }
++}
++void ParallelExecution::restart_pipeline_stream(int stage) {
++    auto& p = *impl_; const auto& c = p.parameters.model.config().text;
++    for (int i = std::max(1, stage * 2); i < stage * 2 + 2; ++i) {
++        auto& r = *p.ranks[i]; if (!r.prefill_lease.valid()) { continue; }
++        r.device->bind_to_current_thread(); r.prefill_stream->end();
++        r.prefill_stream->begin(r.prefill_lease.memory, r.cache->host_table(), r.device->stream,
++            false, stage * (c.num_hidden_layers / 2), (stage + 1) * (c.num_hidden_layers / 2));
++    }
++    p.primary.bind_to_current_thread();
++}
+ void ParallelExecution::end_prefill_stream() {
+     auto& p = *impl_; RestoreDevice restore{p.primary.device};
+     for (int i = 1; i < size(); ++i) {
+@@ -640,6 +675,7 @@
+     // has consumed the pieces, including the primary's own output projection.
+     for (int i = 0; i < size(); ++i) {
+         auto& r = *p.ranks[i]; r.device->bind_to_current_thread();
++        if (!a.output.parallel->shards[i].weight.n) { continue; }
+         Tensor input(r.input.p, DType::BF16, {2 * QW, T});
+         for (int head = 0; head < 2; ++head) {
+             const int owner = attention_head_owner(call.layer_index, head, 2, size());
+@@ -655,6 +691,7 @@
+     }
+     p.primary.bind_to_current_thread();
+     for (int i = 0; i < size(); ++i) {
++        if (!a.output.parallel->shards[i].weight.n) { continue; }
+         if (i) { CUDA_CHECK(cudaStreamWaitEvent(p.primary.stream, p.ranks[i]->gdn_projected, 0)); }
+         const auto& shard = a.output.parallel->shards[i];
+         Tensor local(p.ranks[i]->output.p, DType::BF16, {shard.weight.n, T});
+@@ -695,15 +732,17 @@
+     const auto& config = p.parameters.model.config().text;
+     const int T = x.ne[1], DK = config.gdn.key_head_dim, DV = config.gdn.value_head_dim;
+     const int VW = config.gdn.value_width();
+-    p.start(&x);
++    p.start(&x, g.projection.parallel);
+     for (int i = 0; i < size(); ++i) {
+         auto& r = *p.ranks[i]; r.device->bind_to_current_thread();
+-        Tensor local_x = p.input(i, x);
+         auto& shard = states.shards[i];
++        if (!shard.owns(layer)) { continue; }
++        const int local_layer = layer - shard.first_layer;
++        Tensor local_x = p.input(i, x);
+         auto& work = *r.state_work; work.reset(); const auto s = r.device->stream;
+         const int nk = shard.heads.keys.count, nv = shard.heads.values.count, kw = nk * DK, vw = nv * DV, C = 2 * kw + vw;
+         GdnReplayRecordLayer records;
+-        if (batch.verify) { records = shard.records.narrowed(batch.width).layer(layer, batch.batch); }
++        if (batch.verify) { records = shard.records.narrowed(batch.width).layer(local_layer, batch.batch); }
+         Tensor qkv = batch.verify ? records.conv.view({C, T}) : work.alloc(DType::BF16, {C, T});
+         const auto copy_rows = [&](const Tensor& src, int first, int count, Tensor& dst, int at = 0) {
+             auto part = src.slice(0, first, count); gather_peer_rows(part, dst, at, s);
+@@ -729,7 +768,7 @@
+         Tensor o = work.alloc(DType::BF16, {DV, nv, T});
+         const auto conv = g.parallel_convolution.at(i);
+         const float scale = float(1. / std::sqrt(double(DK)));
+-        auto state = shard.state->layer_view(layer);
++        auto state = shard.state->layer_view(local_layer);
+         if (batch.verify) {
+             const int W = batch.width, B = batch.batch;
+             Tensor conv_out = work.alloc(DType::BF16, {C, W, B});
+@@ -741,9 +780,9 @@
+                 records.key, records.value, records.gate, out, s);
+         } else if (batch.width > 1) {
+             if (batch.batch != 1 || batch.host_slots.empty()) { throw std::invalid_argument("parallel GDN prefill requires one sequence"); }
+-            auto history = shard.state->conv_slot(layer, batch.host_slots.front());
++            auto history = shard.state->conv_slot(local_layer, batch.host_slots.front());
+             ops::causal_conv1d_silu_split(qkv, conv, history, history, q, k, v, s);
+-            auto recurrence = shard.state->recurrent_slot(layer, batch.host_slots.front());
++            auto recurrence = shard.state->recurrent_slot(local_layer, batch.host_slots.front());
+             ops::gated_delta_net(q.view({DK, nk, T}), k.view({DK, nk, T}), v.view({DV, nv, T}), gate, beta,
+                 scale, true, work, recurrence, recurrence, o, r.device->execution_view());
+         } else {
+@@ -767,8 +806,10 @@
+     Tensor output = primary_work.alloc(DType::BF16, {int(config.hidden_size), T});
+     for (int i = 0; i < size(); ++i) {
+         auto& r = *p.ranks[i]; r.device->bind_to_current_thread();
++        if (!states.shards[i].owns(layer)) { continue; }
+         Tensor input(r.input.p, DType::BF16, {VW, T});
+         for (int owner = 0; owner < size(); ++owner) {
++            if (!states.shards[owner].owns(layer)) { continue; }
+             if (owner != i) { CUDA_CHECK(cudaStreamWaitEvent(r.device->stream, p.ranks[owner]->done, 0)); }
+             const auto head = states.shards[owner].heads.values;
+             Tensor local(p.ranks[owner]->gdn_output.data, DType::BF16, {head.count * DV, T});
+@@ -784,8 +825,10 @@
+     }
+     p.primary.bind_to_current_thread();
+     for (int i = 0; i < size(); ++i) {
++        if (!states.shards[i].owns(layer)) { continue; }
+         if (i) { CUDA_CHECK(cudaStreamWaitEvent(p.primary.stream, p.ranks[i]->gdn_projected, 0)); }
+         const auto& shard = g.output.parallel->shards[i];
++        if (!shard.weight.n) { continue; }
+         Tensor local(p.ranks[i]->output.p, DType::BF16, {shard.weight.n, T});
+         int first = 0;
+         for (const auto segment : shard.segments) {
+@@ -800,7 +843,7 @@
+                             float epsilon, Tensor& output, Tensor* inject, WorkspaceArena& work) {
+     auto& p = *impl_; RestoreDevice restore{p.primary.device};
+     const int T = residual.ne[1];
+-    if (!ops::hyper_connection_fused_supported(h.down.weight, h.up.weight, output.ne[0], streams, rank, T)) {
++    if (h.down.parallel->shards[0].weight.n == 0 || !ops::hyper_connection_fused_supported(h.down.weight, h.up.weight, output.ne[0], streams, rank, T)) {
+         auto scope = work.scope();
+         Tensor normalized = work.alloc(DType::BF16, {residual.ne[0], T});
+         ops::hyper_connection_norm(residual, h.norm, streams, epsilon, normalized, p.primary.stream);
+@@ -813,6 +856,7 @@
+             auto& r = *p.ranks[i]; r.device->bind_to_current_thread();
+             auto& scratch = *r.state_work; scratch.reset();
+             const auto& up = h.up.parallel->shards[i];
++            if (!up.weight.n) { continue; }
+             local_norms[i] = scratch.alloc(DType::BF16, {streams * up.units.count, T});
+             local_outputs[i] = scratch.alloc(DType::BF16, {up.units.count, T});
+             Tensor full(i ? r.input.p : normalized.data, DType::BF16, {normalized.ne[0], T});
+@@ -829,6 +873,7 @@
+         p.start(&m, h.up.parallel);
+         for (int i = 0; i < size(); ++i) {
+             auto& r = *p.ranks[i]; const auto& up = h.up.parallel->shards[i];
++            if (!up.weight.n) { continue; }
+             Tensor local_m = p.input(i, m);
+             Tensor u(r.output.p, DType::BF16, {up.weight.n, T});
+             r.workspace->reset();
+@@ -837,6 +882,7 @@
+             p.done(i);
+         }
+         for (int i = 0; i < size(); ++i) {
++            if (!h.up.parallel->shards[i].weight.n) { continue; }
+             p.wait(i); const auto units = h.up.parallel->shards[i].units;
+             gather_peer_rows(local_outputs[i], output, units.begin, p.primary.stream);
+         }
+@@ -849,6 +895,7 @@
+     p.start();
+     for (int i = 1; i <= size(); ++i) {
+         const int r = i % size(); auto& peer = *p.ranks[r];
++        if (!h.down.parallel->shards[r].weight.n) { continue; }
+         Tensor local = p.input(r, residual);
+         Tensor norm = h.norm;
+         if (r) {
+@@ -862,6 +909,7 @@
+         p.done(r);
+     }
+     for (int i = 0; i < size(); ++i) {
++        if (!h.down.parallel->shards[i].weight.n) { continue; }
+         p.wait(i); auto& peer = *p.ranks[i];
+         const auto segment = h.down.parallel->shards[i].segments.front();
+         for (int s = 0; s < streams; ++s) {
+@@ -873,6 +921,7 @@
+     p.start();
+     for (int i = 1; i <= size(); ++i) {
+         const int r = i % size(); auto& peer = *p.ranks[r]; peer.device->bind_to_current_thread();
++        if (!h.up.parallel->shards[r].weight.n) { continue; }
+         if (r) { CUDA_CHECK(cudaStreamWaitEvent(peer.device->stream, root.start, 0)); }
+         copy_peer_bytes(peer.hc_partials.p, root.hc_gathered.p, std::size_t(streams) * rows * T * 4, peer.device->stream);
+         const auto& up = h.up.parallel->shards[r];
+@@ -885,7 +934,8 @@
+         p.done(r);
+     }
+     for (int i = 0; i < size(); ++i) {
+-        p.wait(i); const auto units = h.up.parallel->shards[i].units;
++        if (!h.up.parallel->shards[i].weight.n) { continue; }
++            p.wait(i); const auto units = h.up.parallel->shards[i].units;
+         Tensor local(p.ranks[i]->output.p, DType::BF16, {units.count, T});
+         gather_peer_rows(local, output, units.begin, p.primary.stream);
+     }
+@@ -899,14 +949,16 @@
+     if (T > p.columns) { throw std::invalid_argument("parallel experts exceed the startup plan"); }
+     p.start();
+     for (int i = 1; i < size(); ++i) {
+-        auto& r = *p.ranks[i]; r.device->bind_to_current_thread(); auto s = r.device->stream;
++        auto& r = *p.ranks[i];
++        if (!pipeline_owns(layer, i, c.num_hidden_layers, size())) { continue; }
++        r.device->bind_to_current_thread(); auto s = r.device->stream;
+         CUDA_CHECK(cudaStreamWaitEvent(s, p.ranks.front()->start, 0));
+         copy_peer_bytes(r.expert_input.p, x.data, x.bytes(), s);
+         copy_peer_bytes(r.expert_ids.p, routing.ids.data, routing.ids.bytes(), s);
+         Tensor local_x(r.expert_input.p, DType::BF16, {x.ne[0], T}), output(r.expert_outputs.p, DType::BF16, {x.ne[0], K * T});
+         ops::MoeRouting local; local.ids = Tensor(r.expert_ids.p, DType::I32, {K, T});
+         auto dispatch = ops::carve_moe_dispatch(r.expert_dispatch.p, E, K * T);
+-        ops::moe_dispatch(local, E, dispatch, r.cache->route_log() + layer * r.cache->route_stride(), s, i, size());
++        ops::moe_dispatch(local, E, dispatch, r.cache->route_log() + layer * r.cache->route_stride(), s, i, size(), r.cache->owners(layer));
+         const auto* bank = p.parameters.layers.at(layer).moe.bank;
+         ops::MoeExpertSource source;
+         source.frame_base = r.cache->frame_base(); source.frames = r.cache->table(layer);
+@@ -920,18 +972,21 @@
+             source.prefetched = r.prefill_stream->slots(layer);
+             source.prefetch_base = r.prefill_stream->base();
+         }
+-        const int owned = (E + size() - 1 - i) / size();
++        const int owned = E / 2;
+         ops::moe_experts(local_x, dispatch, source, K, std::min(owned, K * T), r.expert_work.p, output, s);
+         if (prefetched && release_stream) { r.prefill_stream->after_experts(layer, s); }
+         CUDA_CHECK(cudaEventRecord(r.experts_done, s));
+     }
+ }
+-void ParallelExecution::finish_experts(const ops::MoeRouting& routing, Tensor& output) {
++const std::int32_t* ParallelExecution::expert_owners(std::uint32_t layer) const { return impl_->primary_cache->owners(layer); }
++void ParallelExecution::finish_experts(std::uint32_t layer, const ops::MoeRouting& routing, Tensor& output) {
+     auto& p = *impl_; p.primary.bind_to_current_thread();
+     for (int i = 1; i < size(); ++i) {
++        if (!pipeline_owns(layer, i, p.parameters.model.config().text.num_hidden_layers, size())) { continue; }
+         auto& r = *p.ranks[i]; CUDA_CHECK(cudaStreamWaitEvent(p.primary.stream, r.experts_done, 0));
+         Tensor peer(r.expert_outputs.p, DType::BF16, {output.ne[0], output.ne[1]});
+-        gather_peer_experts(peer, routing.ids, output, i, size(), p.primary.stream);
++        const int E = p.parameters.model.config().text.moe.experts;
++        gather_peer_expert_range(peer, routing.ids, output, (i % 2) * (E / 2), E / 2, p.primary.stream);
+     }
+ }
+ void ParallelExecution::resident_experts(const Tensor& x, const ops::MoeRouting& routing, const MtpParameters& m, Tensor& output) {
+--- a/src/models/qwen4_exp/execution/parallel.h
++++ b/src/models/qwen4_exp/execution/parallel.h
+@@ -36,6 +36,9 @@
+     // remain protected until all prefetches and consumers have joined.
+     void begin_prefill_stream();
+     void end_prefill_stream();
++    void restart_pipeline_stream(int stage);
++    void switch_pipeline_stage();
++    void synchronize_pipeline();
+     // Returns false for an explicitly primary-only projection.
+     bool project(const Tensor& x, const LinearParameters& parameters, Tensor& output);
+     void head(const Tensor& x, const LinearParameters& weight, Tensor& output);
+@@ -46,7 +49,8 @@
+                           Tensor& output);
+     void begin_experts(std::uint32_t layer, const Tensor& x, const ops::MoeRouting& routing,
+                        bool streamed, bool release_stream);
+-    void finish_experts(const ops::MoeRouting& routing, Tensor& output);
++    void finish_experts(std::uint32_t layer, const ops::MoeRouting& routing, Tensor& output);
++    const std::int32_t* expert_owners(std::uint32_t layer) const;
+     Tensor attention(const AttentionParameters& parameters, const Tensor& x,
+                      const AttentionCall& call, const Tensor& block_tables,
+                      const ops::PreparedRope& rope, WorkspaceArena& work);
+--- a/src/models/qwen4_exp/execution/parallel_state.cpp
++++ b/src/models/qwen4_exp/execution/parallel_state.cpp
+@@ -12,12 +12,12 @@
+     const int channels = 2 * p.keys.count * c.gdn.key_head_dim + p.values.count * c.gdn.value_head_dim;
+     LayoutBuilder state, records;
+     Layout out;
+-    out.state = plan_linear_attention_state_pool(state, {.layers = c.gdn_layers, .conv_channels = channels,
++    out.state = plan_linear_attention_state_pool(state, {.layers = static_cast<std::uint32_t>(pipeline_layers(c.gdn_layers, ranks)), .conv_channels = channels,
+         .conv_width = int(c.gdn.conv_kernel - 1), .value_heads = p.values.count,
+         .value_head_dim = int(c.gdn.value_head_dim), .key_head_dim = int(c.gdn.key_head_dim), .slot_count = lanes});
+     out.state_bytes = state.finish(256);
+     if (width > 1) {
+-        out.records = plan_gdn_replay_records(records, {.layers = int(c.gdn_layers), .record_capacity = lanes,
++        out.records = plan_gdn_replay_records(records, {.layers = pipeline_layers(c.gdn_layers, ranks), .record_capacity = lanes,
+             .width = width, .conv_channels = channels, .qk_heads = p.keys.count, .value_heads = p.values.count,
+             .key_dim = int(c.gdn.key_head_dim), .value_dim = int(c.gdn.value_head_dim)});
+     }
+@@ -33,6 +33,7 @@
+             CUDA_CHECK(cudaSetDevice(devices[r]));
+             const auto layout = plan(c, devices.size(), r, lanes, width);
+             GdnStateShard shard;
++            shard.first_layer = pipeline_first(r, c.gdn_layers, devices.size());
+             shard.device = devices[r]; shard.heads = gdn_head_partition(c.gdn.key_heads, c.gdn.value_heads, r, devices.size());
+             shard.backing = DeviceBuffer(layout.state_bytes); shard.backing.fill(0);
+             shard.state = std::make_unique<LinearAttentionStatePool>(DeviceSpan{shard.backing.p, shard.backing.bytes}, layout.state);
+--- a/src/models/qwen4_exp/execution/parallel_state.h
++++ b/src/models/qwen4_exp/execution/parallel_state.h
+@@ -14,6 +14,8 @@
+ namespace infernix::models::qwen4_exp::execution {
+ struct GdnStateShard {
+     int device = 0;
++    int first_layer = 0;
++    bool owns(int layer) const { return state && layer >= first_layer && layer < first_layer + state->layer_count(); }
+     GdnHeadPartition heads;
+     DeviceBuffer backing, record_backing;
+     std::unique_ptr<LinearAttentionStatePool> state;
+--- a/src/models/qwen4_exp/execution/parameters.cpp
++++ b/src/models/qwen4_exp/execution/parameters.cpp
+@@ -230,6 +230,7 @@
+                 std::vector<std::uint16_t> full(std::size_t(C) * K);
+                 CUDA_CHECK(cudaMemcpy(full.data(), prepared.convolution.data, full.size() * 2, cudaMemcpyDeviceToHost));
+                 for (std::size_t rank = 0; rank < devices.size(); ++rank) {
++                    if (!pipeline_owns(i, rank, c.num_hidden_layers, devices.size())) { prepared.parallel_convolution.emplace_back(); continue; }
+                     const auto part = gdn_head_partition(c.gdn.key_heads, c.gdn.value_heads, rank, devices.size());
+                     const int kw = part.keys.count * c.gdn.key_head_dim, vw = part.values.count * c.gdn.value_head_dim;
+                     const int local_c = 2 * kw + vw, KW = c.gdn.key_width();
+--- a/src/models/qwen4_exp/head_partition.h
++++ b/src/models/qwen4_exp/head_partition.h
+@@ -4,13 +4,26 @@
+ 
+ namespace infernix::models::qwen4_exp {
+ 
+-// Whole KV heads have one physical owner. Rotate the pair across attention
+-// layers (including the MTP layer); the query group executes on that owner.
++// Experimental TP2+PP2: this candidate targets the 48-block Flash-Next model.
++// It is compiled into an isolated benchmark, never selected by an environment variable.
++inline constexpr bool kPipelineExperiment = true;
++inline constexpr bool kPipelineOverlap = true;
++inline int pipeline_first(int rank, int layers, int ranks) { return ranks == 4 ? (rank / 2) * (layers / 2) : 0; }
++inline int pipeline_layers(int layers, int ranks) { return ranks == 4 ? layers / 2 : layers; }
++inline bool pipeline_owns(int layer, int rank, int layers, int ranks) {
++    return layer >= pipeline_first(rank, layers, ranks) && layer < pipeline_first(rank, layers, ranks) + pipeline_layers(layers, ranks);
++}
++inline int parallel_expert_owner(int layer, int expert, int experts, int layers, int ranks) {
++    return ranks == 4 ? (layer >= layers / 2 ? 2 : 0) + expert / (experts / 2) : expert % ranks;
++}
++
++// Whole KV heads have one physical owner on their pipeline stage. MTP uses
++// the second pair; the query group executes on its KV owner.
+ inline int attention_head_owner(int layer, int head, int kv_heads, int ranks) {
+     if (layer < 0 || head < 0 || head >= kv_heads || kv_heads != 2 || ranks < 2 || ranks > 4) {
+         throw std::invalid_argument("Flash-Next attention requires two KV heads and 2-4 ranks");
+     }
+-    return (std::int64_t(layer) * kv_heads + head) % ranks;
++    return ranks == 4 ? (layer >= 6 ? 2 : 0) + head : (std::int64_t(layer) * kv_heads + head) % ranks;
+ }
+ 
+ struct GdnHeadPartition {
+@@ -22,7 +35,7 @@
+     if (keys < ranks || values <= 0 || values % keys) {
+         throw std::invalid_argument("GDN value heads must form complete key-head groups");
+     }
+-    const auto part = partition_rows(keys, rank, ranks, 1);
++    const auto part = partition_rows(keys, ranks == 4 ? rank % 2 : rank, ranks == 4 ? 2 : ranks, 1);
+     const int group = values / keys;
+     return {part, {part.begin * group, part.count * group}};
+ }
+--- a/src/models/qwen4_exp/load.cpp
++++ b/src/models/qwen4_exp/load.cpp
+@@ -495,6 +495,28 @@
+             mark(m.expert_down.front(), WeightPartition::Experts, static_cast<int>(out->config.text.moe.experts));
+         }
+         const int ranks = static_cast<int>(options.parallel_devices.size());
++        if (ranks != 4 || out->config.text.num_hidden_layers != 48 || out->config.text.gdn_layers != 36 || out->config.text.attention_layers != 12) {
++            throw ArtifactError("TP2+PP2 experiment requires four GPUs and the 48-block Flash-Next model");
++        }
++        // Dense parents within a decoder block live only on that block's pair.
++        const auto pair_parent = [&](WeightId id, int stage) {
++            if (!id.valid()) { return; }
++            const auto object = out->pending.at(id.index).reference.binding.parts.front().object;
++            auto& p = partitions.at(object.index);
++            if (!p.rank_rows.empty()) { return; } // fused parents visited through multiple uses
++            p.rank_rows.resize(4);
++            const int rows = reader.geometry(object).shape[0];
++            for (int r = 0; r < 2; ++r) { p.rank_rows[stage * 2 + r] = parallel_weight_segments(rows, p.kind, p.groups, r, 2); }
++        };
++        const auto pair_hc = [&](const HyperConnectionWeights& h, int stage) { pair_parent(h.down, stage); pair_parent(h.up, stage); };
++        for (int l = 0; l < 48; ++l) {
++            const auto& b = out->weights.layers[l]; const int stage = l / 24;
++            pair_hc(b.attn_hc, stage); pair_hc(b.mlp_hc, stage);
++            pair_parent(b.moe.router, stage); pair_parent(b.moe.shared_gate, stage); pair_parent(b.moe.shared_down, stage);
++            if (b.ple) { pair_parent(b.ple->key_projection, stage); }
++            if (const auto* a = std::get_if<AttentionWeights>(&b.mixer)) { pair_parent(a->output, stage); }
++            else { pair_parent(std::get<GdnWeights>(b.mixer).output, stage); }
++        }
+         const auto assign = [&](WeightId id, int owner, RowPartition rows) {
+             if (rows.count == 0) { return; }
+             const auto& ref = out->pending.at(id.index).reference;
+@@ -531,6 +553,7 @@
+             } else {
+                 const auto& g = std::get<GdnWeights>(mixer);
+                 for (int owner = 0; owner < ranks; ++owner) {
++                    if (!pipeline_owns(layer, owner, c.num_hidden_layers, ranks)) { continue; }
+                     const auto p = gdn_head_partition(c.gdn.key_heads, c.gdn.value_heads, owner, ranks);
+                     const RowPartition k{p.keys.begin * int(c.gdn.key_head_dim), p.keys.count * int(c.gdn.key_head_dim)};
+                     const RowPartition v{p.values.begin * int(c.gdn.value_head_dim), p.values.count * int(c.gdn.value_head_dim)};
+--- a/src/models/qwen4_exp/program/expert_residency.cpp
++++ b/src/models/qwen4_exp/program/expert_residency.cpp
+@@ -1,4 +1,5 @@
+ #include "models/qwen4_exp/program/expert_residency.h"
++#include "models/qwen4_exp/head_partition.h"
+ 
+ #include "models/qwen4_exp/program/host_expert_tier.h"
+ 
+@@ -113,6 +114,17 @@
+     }
+     owner_rank_ = static_cast<std::uint32_t>(rank);
+     owner_count_ = static_cast<std::uint32_t>(count);
++    owner_host_.resize(layers_ * experts_); owned_records_ = 0;
++    for (std::uint32_t l = 0; l < layers_; ++l) for (std::uint32_t e = 0; e < experts_; ++e) {
++        const int owner = parallel_expert_owner(l, e, experts_, layers_, count);
++        owner_host_[l * experts_ + e] = owner; owned_records_ += owner == rank;
++    }
++    owner_device_ = DeviceBuffer(owner_host_.size() * sizeof(std::int32_t));
++    owner_device_.copy_from_host(owner_host_.data(), owner_device_.bytes);
++}
++
++bool ExpertResidency::owns(std::uint32_t layer, std::uint32_t expert) const noexcept {
++    return owner_host_.empty() || owner_host_[layer * experts_ + expert] == int(owner_rank_);
+ }
+ 
+ void ExpertResidency::allow_peer_access(int device) {
+@@ -504,7 +516,7 @@
+         for (std::size_t i = 0; i < used; ++i) {
+             if (!live.empty() && live[i / top_k_] == 0) { continue; }
+             const auto expert = static_cast<std::uint32_t>(ids[i]);
+-            if (expert >= experts_ || expert % owner_count_ != owner_rank_ || seen_[expert]) { continue; }
++            if (expert >= experts_ || !owns(layer, expert) || seen_[expert]) { continue; }
+             seen_[expert] = 1;
+             group_.push_back(layer * experts_ + expert);
+         }
+@@ -604,7 +616,7 @@
+     }
+     std::vector<std::uint32_t> counts(state.counts);
+     for (std::size_t i = 0; i < counts.size(); ++i) {
+-        counts[i] = (i % experts_) % owner_count_ == owner_rank_ ? std::min(counts[i], count_cap) : 0;
++        counts[i] = owns(i / experts_, i % experts_) ? std::min(counts[i], count_cap) : 0;
+     }
+     commands_.clear();
+     // With a tier only keys the warm pre-fill put in RAM can be loaded.
+@@ -612,7 +624,7 @@
+     const std::vector<std::uint32_t>* keys = &state.ranked;
+     if (tier_ != nullptr || owner_count_ > 1) {
+         for (const std::uint32_t key : state.ranked) {
+-            if ((key % experts_) % owner_count_ == owner_rank_ &&
++            if (owns(key / experts_, key % experts_) &&
+                 (tier_ == nullptr || tier_->record(key) != nullptr)) { in_ram.push_back(key); }
+         }
+         keys = &in_ram;
+--- a/src/models/qwen4_exp/program/expert_residency.h
++++ b/src/models/qwen4_exp/program/expert_residency.h
+@@ -91,6 +91,8 @@
+     // Fixed EP ownership; only owned experts enter this cache's policy. Peers
+     // borrow the primary's round lifecycle, but own their allocations and streams.
+     void set_owner(int rank, int count);
++    bool owns(std::uint32_t layer, std::uint32_t expert) const noexcept;
++    const std::int32_t* owners(std::uint32_t layer) const noexcept { return owner_device_.p ? static_cast<const std::int32_t*>(owner_device_.p) + layer * experts_ : nullptr; }
+     void attach_peer(ExpertResidency& cache, DeviceContext& device);
+     // Cache loans can back scratch read by other GPUs. Applies to current and future VMM mappings.
+     void allow_peer_access(int device);
+@@ -144,7 +146,7 @@
+     // Whether the pool can resize after its first size (VMM).
+     [[nodiscard]] bool elastic() const noexcept { return arena_ != nullptr; }
+     [[nodiscard]] std::uint32_t frame_limit() const noexcept {
+-        return std::min(limit_, layers_ * ((experts_ + owner_count_ - 1 - owner_rank_) / owner_count_));
++        return std::min(limit_, owned_records_);
+     }
+     // Bytes the frames occupy now (whole chunks with VMM).
+     [[nodiscard]] std::uint64_t pool_bytes() const noexcept;
+@@ -207,6 +209,9 @@
+     };
+     int device_ = 0;
+     std::uint32_t owner_rank_ = 0, owner_count_ = 1;
++    std::uint32_t owned_records_ = UINT32_MAX;
++    std::vector<std::int32_t> owner_host_;
++    DeviceBuffer owner_device_;
+     std::vector<Peer> peers_;
+     void upload_table(cudaStream_t compute);
+     // Returns every reserved landing frame to the pool.
+--- a/src/models/qwen4_exp/program/prefill_walk.cpp
++++ b/src/models/qwen4_exp/program/prefill_walk.cpp
+@@ -128,7 +128,7 @@
+     };
+     if (cpu_service_) { cpu_service_->wake(); }
+     residency_->before_round(s);
+-    expert_stream_->begin(ring_span(), residency_->host_table(), s);
++    expert_stream_->begin(ring_span(), residency_->host_table(), s, false, 0, parallel_ ? c_.num_hidden_layers / 2 : c_.num_hidden_layers);
+     if (parallel_) { parallel_->begin_prefill_stream(); }
+     for (std::size_t c = 0; c < n; ++c) {
+         const std::int32_t b = walk_.begins[c], w = walk_.widths[c];
+@@ -173,9 +173,14 @@
+         }
+         // The chunk's embedding and first layer run while the host stages the next chunk.
+         const WideWork wide(*this, w);
+-        walk_pass(c, 0);
++        if (parallel_ && kPipelineOverlap) {
++            auto fb = io_batch(slot, 1, w, 1); fb.host_slots = std::span<const std::int32_t>(&walk_.host_slot, 1); fb.host_table_rows = fb.host_slots;
++            fb.vision = walk_.vision[c] ? &*walk_.vision[c] : nullptr;
++            Tensor residual(area + 2ULL * width_ * walk_.offsets[c], DType::BF16, {width_, w});
++            forward_->begin_call(fb, nullptr); forward_->embed(fb, residual);
++        } else { walk_pass(c, 0); }
+     }
+-    walk_.next_layer = 1;
++    walk_.next_layer = parallel_ && kPipelineOverlap ? 0 : 1;
+     walk_prefetch_   = WalkPrefetch{}; // consumed; the slots now hold this span's chunks
+     ++walk_spans_;
+     walk_calls_ += n;
+@@ -263,22 +268,22 @@
+         fb.layer_waits[1] = prefix_->staged_events(walk_.taps[c - 1].staged);
+     }
+     fb.stream         = true;
+-    fb.release_stream = c + 1 == n;
++    fb.release_stream = c + 1 == (pipeline_group_end_ == SIZE_MAX ? n : pipeline_group_end_);
+     Tensor residual(area + 2ULL * static_cast<std::size_t>(width_) * static_cast<std::size_t>(walk_.offsets[c]),
+                     DType::BF16, {width_, w});
+-    const bool logits_here = l + 1 == L && prompt_end && c + 1 == n;
++    const bool logits_here = (l == L || (!pipeline_defer_finish_ && l + 1 == L)) && prompt_end && c + 1 == n;
+     Tensor logits(logits32_.p, DType::FP32, {vocab_, 1});
+     forward_->begin_call(fb, logits_here ? &logits : nullptr);
+-    if (l == 0) { forward_->embed(fb, residual); }
+-    forward_->layer(l, fb, residual);
+-    if (l + 1 == L) { forward_->finish(fb, residual, logits_here ? &logits : nullptr); }
++    if (l == 0 && !(parallel_ && kPipelineOverlap)) { forward_->embed(fb, residual); }
++    if (l < L) { forward_->layer(l, fb, residual); }
++    if (l == L || (!pipeline_defer_finish_ && l + 1 == L)) { forward_->finish(fb, residual, logits_here ? &logits : nullptr); }
+     if (const LayerWalk::Tap& tap = walk_.taps[c]; tap.staged != 0) {
+         // The chunk's end in this layer (and after the last layer, in the MTP block): copy it out.
+         const Lane& lane = lanes_[walk_.lane];
+         std::optional<DeviceKVPageHandle> tail_page;
+         if (tap.frontier % kBlock != 0) { tail_page = lane.pages.at(tap.frontier / kBlock - lane.prefix.page_base).handle(); }
+-        prefix_->capture_group(tap.staged, l, walk_.lane, tail_page, device_.stream);
+-        if (l + 1 == L) { prefix_->capture_group(tap.staged, L, walk_.lane, tail_page, device_.stream); }
++        if (l < L) { prefix_->capture_group(tap.staged, l, walk_.lane, tail_page, device_.stream); }
++        if (l == L || (!pipeline_defer_finish_ && l + 1 == L)) { prefix_->capture_group(tap.staged, L, walk_.lane, tail_page, device_.stream); }
+     }
+ }
+ 
+@@ -319,8 +324,71 @@
+     }
+ }
+ 
++void ProgramImpl::walk_pipeline() {
++    const std::size_t n = walk_.widths.size(), group = std::min<std::size_t>(8, std::max<std::size_t>(1, n / 2));
++    const std::uint32_t half = c_.num_hidden_layers / 2, L = c_.num_hidden_layers;
++    pipeline_defer_finish_ = true;
++    bool auxiliary = false;
++    try {
++        // Interleave one chunk/layer per stage. Queuing a complete half-model
++        // first fills CUDA's submission queue and blocks this single host thread,
++        // leaving the other stage idle despite its independent CUDA stream.
++        for (std::size_t begin = 0; begin < n; begin += group) {
++            const std::size_t end = std::min(n, begin + group);
++            if (begin) {
++                if (begin > group) { parallel_->restart_pipeline_stream(1); }
++                pipeline_switch(); auxiliary = true;
++                CUDA_CHECK(cudaStreamWaitEvent(device_.stream, pipeline_ready_, 0));
++                pipeline_switch(); auxiliary = false;
++                expert_stream_->end();
++                expert_stream_->begin(ring_span(), residency_->host_table(), device_.stream, false, 0, half);
++                parallel_->restart_pipeline_stream(0);
++            }
++            for (std::uint32_t l = 0; l < half; ++l) {
++                const std::size_t count = begin ? group : end - begin;
++                for (std::size_t offset = 0; offset < count; ++offset) {
++                    if (begin) {
++                        pipeline_switch(); auxiliary = true;
++                        pipeline_group_end_ = begin;
++                        walk_pass(begin - group + offset, half + l);
++                        pipeline_switch(); auxiliary = false;
++                    }
++                    if (begin + offset < end) {
++                        pipeline_group_end_ = end;
++                        walk_pass(begin + offset, l);
++                    }
++                }
++            }
++            if (begin) {
++                pipeline_switch(); auxiliary = true;
++                CUDA_CHECK(cudaEventRecord(pipeline_done_, device_.stream));
++                pipeline_switch(); auxiliary = false;
++            }
++            CUDA_CHECK(cudaEventRecord(pipeline_ready_, device_.stream));
++        }
++        const std::size_t begin = (n - 1) / group * group;
++        if (begin) { parallel_->restart_pipeline_stream(1); }
++        pipeline_switch(); auxiliary = true;
++        CUDA_CHECK(cudaStreamWaitEvent(device_.stream, pipeline_ready_, 0));
++        pipeline_group_end_ = n;
++        for (std::uint32_t l = half; l < L; ++l) for (std::size_t c = begin; c < n; ++c) { walk_pass(c, l); }
++        CUDA_CHECK(cudaEventRecord(pipeline_done_, device_.stream));
++        pipeline_switch(); auxiliary = false;
++        CUDA_CHECK(cudaStreamWaitEvent(device_.stream, pipeline_done_, 0));
++        pipeline_defer_finish_ = false; pipeline_group_end_ = SIZE_MAX;
++        for (std::size_t c = 0; c < n; ++c) { walk_pass(c, L); }
++        walk_.next_layer = L;
++    } catch (...) {
++        if (auxiliary) { pipeline_switch(); }
++        try { parallel_->synchronize_pipeline(); } catch (...) {}
++        pipeline_defer_finish_ = false; pipeline_group_end_ = SIZE_MAX;
++        throw;
++    }
++}
++
+ void ProgramImpl::walk_enqueue(std::uint32_t to_layer) {
+     require_tier_round();
++    if (parallel_ && kPipelineOverlap && walk_.next_layer == 0) { walk_pipeline(); return; }
+     for (std::uint32_t l = walk_.next_layer; l < to_layer; ++l) {
+         for (std::size_t c = 0; c < walk_.widths.size(); ++c) { walk_pass(c, l); }
+     }
+@@ -333,7 +401,7 @@
+     for (const auto w : walk_.widths) { tokens += static_cast<std::uint32_t>(w); }
+     // The first step already ran layer 0 while staging.
+     const std::uint32_t to =
+-        std::min(L, walk_.next_layer + walk_.layers_per_step - (walk_.steps == 0 ? 1U : 0U));
++        parallel_ && kPipelineOverlap ? L : std::min(L, walk_.next_layer + walk_.layers_per_step - (walk_.steps == 0 ? 1U : 0U));
+     if (walk_.steps > 0) {
+         // A step boundary, before the step's calls: a decode or verification round of another lane
+         // since the last step closed the tier's round when it settled, and the tier answers fetch
+@@ -413,6 +481,7 @@
+ void ProgramImpl::walk_abandon() noexcept {
+     if (!walk_.active) { return; }
+     try {
++        if (parallel_) { parallel_->synchronize_pipeline(); }
+         device_.synchronize();
+     } catch (...) {}
+     expert_stream_->end();
+--- a/src/models/qwen4_exp/program/prefix/state_image.cpp
++++ b/src/models/qwen4_exp/program/prefix/state_image.cpp
+@@ -242,9 +242,11 @@
+         if (!same) { throw std::invalid_argument("Qwen4Exp state image: the exact window does not match the layout"); }
+     }
+     if (gdn_layers > 0 && !buffers.gdn_shards.empty()) {
++        for (int layer = 0; layer < gdn_layers; ++layer) {
+         std::size_t recurrence = 0, conv = 0;
+         for (const auto& shard : buffers.gdn_shards) {
+-            if (!shard.state || shard.state->layer_count() != gdn_layers || shard.state->slot_count() < int(buffers.lanes)) {
++            if (!shard.owns(layer)) { continue; }
++            if (!shard.state || shard.state->slot_count() < int(buffers.lanes)) {
+                 throw std::invalid_argument("parallel lane image state geometry mismatch");
+             }
+             recurrence += shard.state->recurrent_slot(0, 0).bytes();
+@@ -253,6 +255,7 @@
+         if (recurrence != spec.gdn_recurrent_bytes || conv != spec.gdn_conv_bytes) {
+             throw std::invalid_argument("parallel lane image does not cover all GDN state");
+         }
++        }
+     } else if (gdn_layers > 0) {
+         if (buffers.gdn == nullptr || buffers.gdn->layer_count() != gdn_layers ||
+             buffers.gdn->slot_count() < static_cast<std::int32_t>(buffers.lanes) ||
+@@ -269,15 +272,16 @@
+     if (!buffers_.gdn_shards.empty() &&
+         (part.kind == StateImagePart::Kind::GdnRecurrent || part.kind == StateImagePart::Kind::GdnConv)) {
+         int keys = 0, values = 0;
+-        for (const auto& shard : buffers_.gdn_shards) { keys += shard.heads.keys.count; values += shard.heads.values.count; }
++        for (const auto& shard : buffers_.gdn_shards) { if (shard.owns(part.index)) { keys += shard.heads.keys.count; values += shard.heads.values.count; } }
+         const auto& spec = buffers_.gdn_shards.front().state->spec();
+         const std::size_t DK = spec.key_head_dim, DV = spec.value_head_dim, KW = keys * DK, VW = values * DV;
+         for (const auto& shard : buffers_.gdn_shards) {
++            if (!shard.owns(part.index)) { continue; }
+             if (part.kind == StateImagePart::Kind::GdnRecurrent) {
+-                const auto state = shard.state->recurrent_slot(part.index, lane);
++                const auto state = shard.state->recurrent_slot(part.index - shard.first_layer, lane);
+                 runs.push_back({static_cast<std::byte*>(state.data), shard.heads.values.begin * DK * DV * 4, state.bytes()});
+             } else {
+-                const auto state = shard.state->conv_slot(part.index, lane);
++                const auto state = shard.state->conv_slot(part.index - shard.first_layer, lane);
+                 const std::size_t kw = shard.heads.keys.count * DK, vw = shard.heads.values.count * DV;
+                 for (int t = 0; t < spec.conv_width; ++t) {
+                     auto* src = static_cast<std::byte*>(state.data) + t * (2 * kw + vw) * 2;
+--- a/src/models/qwen4_exp/program/program_impl.h
++++ b/src/models/qwen4_exp/program/program_impl.h
+@@ -579,7 +579,7 @@
+         b.kv_pages  = d.kv_pages;
+         b.kv        = d.kv_elastic ? kv_mapped_bytes(d, d.kv_base_pages) : d.kv;
+         b.kv_max    = parallel ? kv_mapped_bytes(d, d.kv_pages) : d.kv;
+-        b.workspace = d.work;
++        b.workspace = d.work + (parallel ? std::max(d.work, d.wide_work) : 0);
+         b.staging   = d.staging;
+         b.state     = (parallel ? execution::ParallelGdnState::planned_bytes(c, o.parallel_devices.size(), 0, lanes, W)
+                                : d.gdn_bytes + d.records_bytes) + d.ple + d.tails + d.window_local + d.ple_records + d.qsa_records +
+@@ -804,6 +804,12 @@
+         wide_work_     = plan_.wide_work;
+         work_          = std::make_unique<WorkspaceArena>(work_capacity_);
+         allocated += work_capacity_;
++        if (!options_.parallel_devices.empty()) {
++            pipeline_work_ = std::make_unique<WorkspaceArena>(std::max(plan_.work, plan_.wide_work));
++            allocated += pipeline_work_->capacity();
++            CUDA_CHECK(cudaEventCreateWithFlags(&pipeline_ready_, cudaEventDisableTiming));
++            CUDA_CHECK(cudaEventCreateWithFlags(&pipeline_done_, cudaEventDisableTiming));
++        }
+ 
+         // The promotions' copy sources: the banks where the device reads them (cudaMemcpyBatchAsync
+         // faults on a registered block's host address where the device maps it elsewhere: WDDM).
+@@ -883,8 +889,8 @@
+                     banks.push_back(reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.device_records));
+                 }
+                 const auto owners = std::max<std::size_t>(1, options_.parallel_devices.size());
+-                record_of = [banks = std::move(banks), record_stride, owners](std::uint32_t layer, std::uint32_t expert) -> const std::uint8_t* {
+-                    if (expert % owners != 0) { return nullptr; }
++                record_of = [banks = std::move(banks), record_stride, owners, layers = c_.num_hidden_layers, experts = c_.moe.experts](std::uint32_t layer, std::uint32_t expert) -> const std::uint8_t* {
++                    if (parallel_expert_owner(layer, expert, experts, layers, owners) != 0) { return nullptr; }
+                     return banks[layer] + static_cast<std::size_t>(expert) * record_stride;
+                 };
+             }
+@@ -1009,6 +1015,8 @@
+         report_lane_cost(lanes, record_stride);
+     }
+ 
++    ~ProgramImpl() { if (parallel_) { try { parallel_->synchronize_pipeline(); } catch (...) {} } if (pipeline_ready_) { cudaEventDestroy(pipeline_ready_); } if (pipeline_done_) { cudaEventDestroy(pipeline_done_); } }
++
+     const DeviceLayout& device_layout() const noexcept { return plan_; }
+     const VramSizing& vram_sizing() const noexcept { return sizing_; }
+ 
+@@ -4366,6 +4374,12 @@
+     std::unique_ptr<KVExecutionTablePool> tables_;
+     std::size_t work_capacity_ = 0;
+     std::unique_ptr<WorkspaceArena> work_;
++    std::unique_ptr<WorkspaceArena> pipeline_work_;
++    cudaEvent_t pipeline_ready_ = nullptr, pipeline_done_ = nullptr;
++    bool pipeline_defer_finish_ = false;
++    std::size_t pipeline_group_end_ = SIZE_MAX;
++    void pipeline_switch() { parallel_->switch_pipeline_stage(); std::swap(*work_, *pipeline_work_); }
++    void walk_pipeline();
+     // SSD tier mode (design §19.3.7): the fetch channel and the tier outlive everything that reads
+     // their memory (the residency's promotion copies, the stream, the CPU service), declared later.
+     std::unique_ptr<ops::offloaded_moe::FetchChannel> fetch_channel_;
+--- a/src/ops/offloaded_sparse_moe/cuda/moe_layer.cu
++++ b/src/ops/offloaded_sparse_moe/cuda/moe_layer.cu
+@@ -559,7 +559,7 @@
+ // route below.
+ __global__ void __launch_bounds__(kDispatchThreads)
+     dispatch_small_kernel(const std::int32_t* __restrict__ ids, int entries, int experts, MoeDispatch dispatch,
+-                          std::int32_t* __restrict__ route_log, int rank, int ranks) {
++                          std::int32_t* __restrict__ route_log, int rank, int ranks, const std::int32_t* owners) {
+     __shared__ std::int32_t count[kDispatchThreads];
+     __shared__ std::int32_t cursor[kDispatchThreads];
+     __shared__ std::int32_t warp_totals[2][kDispatchThreads / 32];
+@@ -568,7 +568,7 @@
+     __syncthreads();
+     const int id = i < entries ? ids[i] : 0;
+     if (i < entries) {
+-        if (id % ranks == rank) { atomicAdd(&count[id], 1); }
++        if ((owners ? owners[id] : id % ranks) == rank) { atomicAdd(&count[id], 1); }
+         if (route_log != nullptr) { route_log[i] = id; }
+     }
+     __syncthreads();
+@@ -576,16 +576,16 @@
+     if (i < experts) { dispatch.counts[i] = c; }
+     dispatch_scan(c, experts, dispatch.offsets, cursor, dispatch.jobs, dispatch.job_count, warp_totals);
+     __syncthreads();
+-    if (i < entries && id % ranks == rank) { dispatch.entries[atomicAdd(&cursor[id], 1)] = i; }
++    if (i < entries && (owners ? owners[id] : id % ranks) == rank) { dispatch.entries[atomicAdd(&cursor[id], 1)] = i; }
+ }
+ 
+ __global__ void count_kernel(const std::int32_t* __restrict__ ids, int entries,
+                              std::int32_t* __restrict__ counts, std::int32_t* __restrict__ route_log,
+-                             int rank, int ranks) {
++                             int rank, int ranks, const std::int32_t* owners) {
+     const int i = blockIdx.x * blockDim.x + threadIdx.x;
+     if (i < entries) {
+         const int id = ids[i];
+-        if (id % ranks == rank) { atomicAdd(&counts[id], 1); }
++        if ((owners ? owners[id] : id % ranks) == rank) { atomicAdd(&counts[id], 1); }
+         if (route_log != nullptr) { route_log[i] = id; }
+     }
+ }
+@@ -602,9 +602,9 @@
+ 
+ __global__ void scatter_kernel(const std::int32_t* __restrict__ ids, int entries,
+                                std::int32_t* __restrict__ cursor, std::int32_t* __restrict__ out,
+-                               int rank, int ranks) {
++                               int rank, int ranks, const std::int32_t* owners) {
+     const int i = blockIdx.x * blockDim.x + threadIdx.x;
+-    if (i < entries && ids[i] % ranks == rank) { out[atomicAdd(&cursor[ids[i]], 1)] = i; }
++    if (i < entries && (owners ? owners[ids[i]] : ids[i] % ranks) == rank) { out[atomicAdd(&cursor[ids[i]], 1)] = i; }
+ }
+ 
+ // --------------------------------------------------------------------------------------- experts
+@@ -1549,7 +1549,7 @@
+ }
+ 
+ void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& dispatch,
+-                  std::int32_t* route_log, cudaStream_t stream, int owner_rank, int owner_count) {
++                  std::int32_t* route_log, cudaStream_t stream, int owner_rank, int owner_count, const std::int32_t* owners) {
+     require(experts > 0 && experts <= kDispatchThreads, "dispatch supports up to 1024 experts");
+     require(owner_count > 0 && owner_rank >= 0 && owner_rank < owner_count, "invalid expert owner");
+     const int entries = static_cast<int>(routing.ids.numel());
+@@ -1557,20 +1557,20 @@
+     if (entries <= kDispatchThreads) {
+         // Decode and verification widths (k * T <= 1024): one kernel and no memset node.
+         dispatch_small_kernel<<<1, kDispatchThreads, 0, stream>>>(ids, entries, experts, dispatch, route_log,
+-                                                                 owner_rank, owner_count);
++                                                                 owner_rank, owner_count, owners);
+         check_launch("dispatch");
+         return;
+     }
+     require(cudaMemsetAsync(dispatch.counts, 0, sizeof(std::int32_t) * experts, stream) == cudaSuccess,
+             "dispatch could not clear its counts");
+     count_kernel<<<(entries + kThreads - 1) / kThreads, kThreads, 0, stream>>>(ids, entries, dispatch.counts,
+-                                                                                route_log, owner_rank, owner_count);
++                                                                                route_log, owner_rank, owner_count, owners);
+     check_launch("count");
+     scan_kernel<<<1, kDispatchThreads, 0, stream>>>(dispatch.counts, experts, dispatch.offsets, dispatch.cursor,
+                                                     dispatch.jobs, dispatch.job_count);
+     check_launch("scan");
+     scatter_kernel<<<(entries + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+-        ids, entries, dispatch.cursor, dispatch.entries, owner_rank, owner_count);
++        ids, entries, dispatch.cursor, dispatch.entries, owner_rank, owner_count, owners);
+     check_launch("scatter");
+ }
+ 
+--- a/include/infernix/ops/offloaded_sparse_moe.h
++++ b/include/infernix/ops/offloaded_sparse_moe.h
+@@ -67,7 +67,7 @@
+ /// unspecified). When `route_log` is not null it also receives a copy of the k*T ids. The arrays need
+ /// no clearing between calls, so a captured call replays correctly.
+ void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& dispatch,
+-                  std::int32_t* route_log, cudaStream_t stream, int owner_rank = 0, int owner_count = 1);
++                  std::int32_t* route_log, cudaStream_t stream, int owner_rank = 0, int owner_count = 1, const std::int32_t* owners = nullptr);
+ 
+ /// The layer's routed expert records: expert e's record is at frame_base + frames[e] *
+ /// record_stride when frames[e] >= 0, else at host_records + e * record_stride (pinned host
+--- a/tests/cmake/CoreTests.cmake
++++ b/tests/cmake/CoreTests.cmake
+@@ -121,3 +121,6 @@
+   LIBRARIES infernix_model_runtime)
+ set_tests_properties(infernix_parallel_expert_stream_test PROPERTIES
+   SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;multi-gpu")
++
++add_test(NAME infernix_parallel_expert_owners_test COMMAND infernix_offloaded_moe_layer_test --owners)
++set_tests_properties(infernix_parallel_expert_owners_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;multi-gpu")
+--- a/tests/ops/test_offloaded_moe_layer.cu
++++ b/tests/ops/test_offloaded_moe_layer.cu
+@@ -730,7 +730,7 @@
+ // entries as a set, and the route-log copy. The dispatch arrays start as garbage, and a captured
+ // call is replayed on new ids, so neither route may depend on memory cleared outside the call.
+ // Entries <= 1024 take the one-CTA kernel, more the count/scan/scatter kernels.
+-void test_dispatch(int experts, int entries, std::uint32_t seed) {
++void test_dispatch(int experts, int entries, std::uint32_t seed, int owner = 0, int owner_count = 1, int layout = 0) {
+     std::mt19937 rng(seed);
+     std::uniform_int_distribution<int> pick(0, experts - 1);
+     const auto random_ids = [&] {
+@@ -739,6 +739,10 @@
+         for (auto& id : ids) { id = (rng() % 4 == 0) ? pick(rng) % 8 : pick(rng); }
+         return ids;
+     };
++    std::vector<std::int32_t> owners(experts);
++    for (int e = 0; e < experts; ++e) { owners[e] = layout == 1 ? 2 + e / (experts / 2) : layout == 2 ? (e < 124 ? 0 : e < 248 ? 1 : e < 380 ? 2 : 3) : e % owner_count; }
++    std::int32_t* d_owners = nullptr;
++    if (layout) { cuda_check(cudaMalloc(&d_owners, experts * sizeof(std::int32_t)), "owners alloc"); cuda_check(cudaMemcpy(d_owners, owners.data(), experts * sizeof(std::int32_t), cudaMemcpyHostToDevice), "owners copy"); }
+     std::int32_t* d_ids = nullptr;
+     std::int32_t* d_log = nullptr;
+     void* d_dispatch    = nullptr;
+@@ -763,7 +767,7 @@
+                    "copy");
+         cuda_check(cudaMemcpy(log.data(), d_log, sizeof(std::int32_t) * entries, cudaMemcpyDeviceToHost), "copy");
+         std::vector<std::vector<std::int32_t>> by_expert(experts);
+-        for (int i = 0; i < entries; ++i) { by_expert[ids[i]].push_back(i); }
++        for (int i = 0; i < entries; ++i) { if (owners[ids[i]] == owner) { by_expert[ids[i]].push_back(i); } }
+         // The first mismatching field, so a failure names what went wrong.
+         const char* first_bad = log == ids ? nullptr : "route log";
+         int used = 0, start = 0, bad_expert = -1;
+@@ -783,7 +787,7 @@
+             if (first_bad != nullptr) { bad_expert = e; }
+             start += c;
+         }
+-        if (first_bad == nullptr && offsets[experts] != entries) { first_bad = "total offset"; }
++        if (first_bad == nullptr && offsets[experts] != start) { first_bad = "total offset"; }
+         if (first_bad == nullptr && job_count != used) { first_bad = "job count"; }
+         const bool ok = first_bad == nullptr;
+         if (ok) {
+@@ -797,7 +801,7 @@
+ 
+     const auto first = random_ids();
+     cuda_check(cudaMemcpy(d_ids, first.data(), sizeof(std::int32_t) * entries, cudaMemcpyHostToDevice), "copy");
+-    infernix::ops::moe_dispatch(routing, experts, dispatch, d_log, nullptr);
++    infernix::ops::moe_dispatch(routing, experts, dispatch, d_log, nullptr, owner, owner_count, d_owners);
+     cuda_check(cudaDeviceSynchronize(), "dispatch");
+     verify(first, "eager");
+ 
+@@ -806,7 +810,7 @@
+     cudaGraphExec_t exec = nullptr;
+     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
+     cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "capture");
+-    infernix::ops::moe_dispatch(routing, experts, dispatch, d_log, stream);
++    infernix::ops::moe_dispatch(routing, experts, dispatch, d_log, stream, owner, owner_count, d_owners);
+     cuda_check(cudaStreamEndCapture(stream, &graph), "capture");
+     cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+     for (int replay = 0; replay < 2; ++replay) {
+@@ -825,6 +829,7 @@
+     cudaFree(d_dispatch);
+     cudaFree(d_log);
+     cudaFree(d_ids);
++    cudaFree(d_owners);
+ }
+ 
+ } // namespace
+@@ -835,6 +840,12 @@
+         return 77;
+     }
+     try {
++        if (argc == 2 && std::strcmp(argv[1], "--owners") == 0) {
++            for (int layout : {0, 1, 2}) for (int rank = 0; rank < 4; ++rank) {
++                for (int entries : {1, 10, 1024, 1025, 20480}) { test_dispatch(512, entries, 100U + entries, rank, 4, layout); }
++            }
++            return g_failures == 0 ? 0 : 1;
++        }
+         if (argc == 2 && std::strcmp(argv[1], "--multi-device") == 0) {
+             int devices = 0;
+             cuda_check(cudaGetDeviceCount(&devices), "device count");
+--- a/tests/test_parallel_partition.cpp
++++ b/tests/test_parallel_partition.cpp
+@@ -20,14 +20,17 @@
+     try {
+         namespace q = infernix::models::qwen4_exp;
+         for (int ranks : {2, 3, 4}) {
++            for (int layer = 0; layer < 36; ++layer) {
+             int keys = 0, values = 0;
+             for (int rank = 0; rank < ranks; ++rank) {
++                if (!q::pipeline_owns(layer, rank, 36, ranks)) { continue; }
+                 const auto heads = q::gdn_head_partition(16, 48, rank, ranks);
+                 check(heads.keys.begin == keys && heads.values.begin == values, "GDN head gap or overlap");
+                 check(heads.values.count == 3 * heads.keys.count, "GDN group split");
+                 keys += heads.keys.count; values += heads.values.count;
+             }
+             check(keys == 16 && values == 48, "GDN coverage");
++            }
+             std::vector<int> owned(ranks);
+             for (int layer = 0; layer < 12; ++layer) {
+                 const int a = q::attention_head_owner(layer, 0, 2, ranks);
+@@ -36,6 +39,13 @@
+             }
+             for (int n : owned) { check(n == 24 / ranks, "attention owner rotation is unbalanced"); }
+         }
++        std::vector<int> experts_owned(4);
++        for (int l = 0; l < 48; ++l) for (int e = 0; e < 512; ++e) {
++            const int owner = q::parallel_expert_owner(l, e, 512, 48, 4);
++            check(owner >= 0 && owner < 4 && q::pipeline_owns(l, owner, 48, 4), "expert escapes its pipeline stage");
++            ++experts_owned[owner];
++        }
++        for (int n : experts_owned) { check(n == 6144, "unbalanced pipeline expert capacity"); }
+         for (int rows : {1, 16, 48, 96, 320, 324, 640, 1280, 2560, 13952, 16384, 248320, INT_MAX}) {
+             for (int ranks : {1, 2, 3, 4}) {
+                 std::int64_t cursor = 0;
+--- a/tests/test_parallel_state.cpp
++++ b/tests/test_parallel_state.cpp
+@@ -19,9 +19,9 @@
+ void require(bool value, const char* message) { if (!value) { throw std::runtime_error(message); } }
+ q::TextConfig config() {
+     q::TextConfig c;
+-    c.hidden_size = 2560; c.num_hidden_layers = 4;
+-    c.layer_types = {q::MixerKind::Gdn, q::MixerKind::Attention, q::MixerKind::Gdn, q::MixerKind::Attention};
+-    c.attention_layers = c.gdn_layers = 2;
++    c.hidden_size = 2560; c.num_hidden_layers = 48;
++    for (int l = 0; l < 48; ++l) { c.layer_types.push_back(l % 4 == 3 ? q::MixerKind::Attention : q::MixerKind::Gdn); }
++    c.attention_layers = 12; c.gdn_layers = 36;
+     c.attention = {24, 2, 256};
+     c.gdn.key_heads = 16; c.gdn.value_heads = 48;
+     c.gdn.key_head_dim = c.gdn.value_head_dim = 128; c.gdn.conv_kernel = 4;
+@@ -95,7 +95,7 @@
+         }
+     }
+     const auto layout = px::plan_state_image(px::state_image_spec(c, true, KvCacheStorage::Vq2));
+-    DeviceBuffer ple(layout.spec.ple_bytes * lanes), tails(layout.spec.qsa_tail_bytes * 3 * lanes), saved(layout.spec.mtp_saved_bytes * lanes);
++    DeviceBuffer ple(layout.spec.ple_bytes * lanes), tails(layout.spec.qsa_tail_bytes * (c.attention_layers + 1) * lanes), saved(layout.spec.mtp_saved_bytes * lanes);
+     const px::LaneStateBuffers buffers{.gdn_shards = gdn.shards, .lanes = lanes,
+         .ple = static_cast<std::byte*>(ple.p), .tails = static_cast<std::byte*>(tails.p),
+         .mtp_saved = static_cast<std::byte*>(saved.p), .window = static_cast<std::byte*>(window.base()), .window_geometry = geometry};
+--- a/tests/test_parallel_weights.cpp
++++ b/tests/test_parallel_weights.cpp
+@@ -150,20 +150,22 @@
+                 bool stream_features = false, int semantic_heads = 0) {
+     auto host = make_weight(codec, N, K, 2917);
+     std::vector<std::vector<RowPartition>> rows;
+-    if (semantic_heads == 1) {
++    if (semantic_heads == 1 || semantic_heads == 4) {
+         rows.resize(world.ids.size());
+         for (int head = 0; head < 2; ++head) {
+-            rows[q::attention_head_owner(1, head, 2, world.ids.size())].push_back({head * N / 2, N / 2});
++            rows[q::attention_head_owner(semantic_heads == 4 ? 7 : 1, head, 2, world.ids.size())].push_back({head * N / 2, N / 2});
+         }
+     } else if (semantic_heads == 2) {
+         rows.resize(world.ids.size());
+         for (int rank = 0; rank < int(rows.size()); ++rank) {
++            if (!q::pipeline_owns(0, rank, 36, rows.size())) { continue; }
+             const auto h = q::gdn_head_partition(16, 48, rank, rows.size()).values;
+             rows[rank] = {{h.begin, h.count}, {48 + h.begin, h.count}};
+         }
+     } else if (semantic_heads == 3) {
+         rows.resize(world.ids.size());
+         for (int rank = 0; rank < int(rows.size()); ++rank) {
++            if (!q::pipeline_owns(0, rank, 36, rows.size())) { continue; }
+             const auto h = q::gdn_head_partition(16, 48, rank, rows.size());
+             const int k = h.keys.begin * 128, nk = h.keys.count * 128;
+             const int v = h.values.begin * 128, nv = h.values.count * 128;
+@@ -392,6 +394,7 @@
+         wide_collapse(world);
+         for (auto codec : {QType::BF16, QType::Q8_G32_FP16}) {
+             projection(world, codec, 512, 2560, 5, DType::BF16, false, false, true);
++            projection(world, codec, 512, 2560, 5, DType::BF16, false, false, 4);
+             projection(world, codec, 96, 2560, 17, DType::BF16, false, false, 2);
+             projection(world, codec, 16384, 2560, 1, DType::BF16, false, false, 3);
+             projection(world, codec, 16384, 2560, 17, DType::BF16, false, false, 3);
+--- a/src/ops/linear_attention/gated_delta_net/replay.cpp
++++ b/src/ops/linear_attention/gated_delta_net/replay.cpp
+@@ -163,7 +163,9 @@
+     const bool shard_36 = spec.layers == 36 &&
+         (spec.qk_heads == 4 || spec.qk_heads == 5 || spec.qk_heads == 6 || spec.qk_heads == 8) &&
+         spec.value_heads == 3 * spec.qk_heads && spec.conv_channels == 640 * spec.qk_heads;
+-    return geometry_48 || geometry_30 || geometry_36 || shard_36;
++    const bool pipeline_shard = spec.layers == 18 && spec.qk_heads == 8 &&
++        spec.value_heads == 24 && spec.conv_channels == 5120;
++    return geometry_48 || geometry_30 || geometry_36 || shard_36 || pipeline_shard;
+ }
+ 
+ void validate_fold_records(const GdnReplayRecords& records) {
+--- a/tests/ops/test_gdn_replay_fold.cpp
++++ b/tests/ops/test_gdn_replay_fold.cpp
+@@ -801,6 +801,9 @@
+             failures += run_case({36, heads * 3, heads * 640}, 5, 3, {5, 3, 0}, 83100U + heads, true);
+             failures += run_case({36, heads * 3, heads * 640}, 17, 1, {13}, 83200U + heads, true);
+         }
++        kQkHeads = 8;
++        failures += run_case({18, 24, 5120}, 5, 3, {5, 3, 0}, 83308U, true);
++        failures += run_case({18, 24, 5120}, 17, 1, {13}, 83408U, true);
+         return failures ? 1 : 0;
+     }
+     if (argc >= 2 && std::string(argv[1]) == "--wide-only") {
+--- a/src/ops/linear_attention/gated_delta_net/recurrent.cu
++++ b/src/ops/linear_attention/gated_delta_net/recurrent.cu
+@@ -259,6 +259,9 @@
+         case 8: launch_replay_fold_fixed<FoldGeometry<36, 8, 24, 5120>>(records, states, rows, active_rows, stream); return;
+         }
+     }
++    if (records.spec.layers == 18 && records.spec.qk_heads == 8 && records.spec.value_heads == 24 && records.spec.conv_channels == 5120) {
++        launch_replay_fold_fixed<FoldGeometry<18, 8, 24, 5120>>(records, states, rows, active_rows, stream); return;
++    }
+     throw std::invalid_argument("GDN replay fold launcher received an unregistered geometry");
+ }
+ 

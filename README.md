@@ -1,14 +1,74 @@
-# Infernix
+# Infernix — experimental multi-GPU fork
 
-> **AI disclaimer:** Everything added to this engine since it forked from NInfer, including most of
-> this README, was written with AI (mostly Claude Opus 5.5, Qwen3.8-27B running on Infernix, plus a
-> few other AI systems I’ve been testing). It is likely to be neither complete nor entirely
-> accurate. This is hobby development.
+> **AI disclaimer:** This engine and its documentation contain substantial AI-written code,
+> including the multi-GPU work in this fork. This is experimental hobby development;
+> the validation scope and remaining limitations are documented below.
 
-Infernix is a C++/CUDA inference engine that serves Qwen models on a single NVIDIA
-RTX 50-series GPU (tuned on the RTX 5090). It began as a fork of
-[NInfer](https://github.com/Neroued/ninfer) by [Neroued](https://github.com/Neroued) and has grown
-into its own engine; it reads NInfer's `.ninfer` artifacts as well as its own `.infernix` files.
+This fork of [Wallawalla47/Infernix](https://github.com/Wallawalla47/Infernix) adds
+tensor parallelism and a TP2+PP2 pipeline layout for Qwen3.8-Flash-Next on multiple
+NVIDIA RTX 50-series GPUs. It was developed and tested on **4× RTX 5060 Ti 16 GB**
+cards, with PCIe Gen5 x4 per card, working peer-to-peer access, a Ryzen 7600X,
+96 GB RAM and Fedora Server.
+
+Infernix is a C++/CUDA inference engine originally tuned for a single RTX 5090.
+It began as a fork of [NInfer](https://github.com/Neroued/ninfer) by
+[Neroued](https://github.com/Neroued); it reads NInfer's `.ninfer` artifacts as well
+as its own `.infernix` files. The original single-GPU route remains available.
+
+## Four-GPU Flash-Next
+
+Dense weights load directly into GPU-owned shards. KV cache follows its attention
+heads and projection weights; GDN recurrent state and convolution history are
+also sharded. Routed experts use disjoint caches while retaining Infernix's
+pinned-RAM offload, CPU computation of some expert misses, NVMe n-gram lookup,
+CUDA graphs, MTP speculation and prefix reuse.
+
+- **TP4:** `--parallel-devices 0,1,2,3`, with rotating KV owners by default.
+- **TP2+PP2:** add `--pipeline-parallel`. The first GPU pair handles decoder
+  blocks 0–23 and the second handles blocks 24–47, overlapping long-prompt chunks.
+  This is the recommended starting point for long uncached prompts on the tested rig.
+- **TP4 with fixed KV owners:** add `--fixed-kv-owners` instead. Both KV heads
+  stay on the first two GPUs; GDN and expert work still spans all four.
+
+All layouts below used the same NVIDIA NVFP4 Dense8 artifact, a 2048-token prefill
+chunk, **131,072-token INT8 KV capacity**, one lane, CUDA graphs, two warmups and
+three measured repetitions. Rates are means in tokens per second:
+
+| Workload / metric | TP4 rotating KV | TP4 fixed KV | TP2+PP2 |
+|---|---:|---:|---:|
+| 64K prompt, ordinary decode: prefill | 1,216 | 1,214 | **1,799** |
+| 64K prompt, ordinary decode: generation | 35.4 | **38.0** | 34.9 |
+| 64K prompt + 256 outputs: request time | 61.24 s | 60.82 s | **43.86 s** |
+| 8K prompt, MTP3: prefill | 1,140 | 1,144 | **1,347** |
+| 8K prompt, MTP3: generation | 110.5 | **110.9** | 104.5 |
+
+TP2+PP2 improves 64K prefill by **48%** and shortens that whole request by **28%**
+versus rotating TP4. Its ordinary decode is 1.5% slower at 64K, and MTP decode is
+5.4% slower at 8K. The 8K MTP rate is not a 64K decode measurement. These are
+public Engine benchmarks, not HTTP timings or a matched comparison with Strata.
+
+**Qualification and tradeoffs:** all three layouts completed a 131,000-token
+prompt plus 33 outputs with MTP3 and physical KV growth/shrink. Those single cold
+capacity probes are not warmed throughput measurements: pipeline decode was
+17.8 tok/s versus rotating TP4's 23.4, despite a shorter whole request. Basic
+OpenAI chat checks passed prefix reuse, two concurrent lanes and cancellation
+recovery. Pipeline cached responses were slower in those functional checks;
+short-prompt prefill can also regress. Partitioning changes floating-point
+reduction order and can change tokens and speculative acceptance. Mathematical
+Op checks pass, but general model-quality parity and broad serving/load
+qualification remain unestablished.
+
+Multi-GPU currently requires **Linux, 2–4 SM120 GPUs, P2P between every pair,
+BF16/Q8 dense weights and the full main expert bank in RAM**. TP2+PP2 and fixed
+KV ownership require four GPUs and are mutually exclusive. FP8 dense artifacts
+and SSD expert offload are not supported on this path. GPU 0 remains the residual
+and scheduling coordinator, and aggregate VRAM is not one allocation pool.
+Flash-Next uses MTP; DFlash/DFlash2 are not wired for this model family.
+
+See the [Linux launch example](#four-gpu-launch-linux),
+[container build and test instructions](tools/tp4/README.md),
+[performance details](docs/performance.md#experimental-four-gpu-flash-next) and
+[complete validation and experiment record](docs/maintainer/multi-gpu-5060-ti-design.md).
 
 ## Why Infernix
 
@@ -35,6 +95,9 @@ table from an NVMe drive.
   ([models](#models)).
 
 Setup and tuning: the [Qwen3.8-Flash-Next guide](docs/qwen3_8-flash-next.md).
+
+The single-5090 claims in this section and benchmarks below are retained from
+upstream. They do not describe or qualify this fork's multi-GPU path.
 
 ### Qwen3.8-27B: more cache hits, faster prefill and decode
 
@@ -76,6 +139,10 @@ Setup and tuning: the [Qwen3.8-Flash-Next guide](docs/qwen3_8-flash-next.md).
 - **Windows and Linux**: native MSVC and GCC builds, WSL2 included.
 
 ## Benchmarks
+
+These are **upstream single-GPU measurements**, retained for reference; they were
+not rerun on this fork. This fork's measurements are under
+[Four-GPU Flash-Next](#four-gpu-flash-next).
 
 One machine: an RTX 5090 (32 GB) in a **PCIe Gen5 x8** link, a Core i9-13900K, 96 GB of DDR5 and
 Windows 11. At Gen5 x16 speeds are likely to be higher, most of all for Qwen3.8-Flash-Next, whose
@@ -235,6 +302,39 @@ The server is `build/apps/infernix-serve` and takes the same options. Under WSL2
 NVIDIA driver (do not install a Linux one inside WSL) and copy models into the Linux filesystem
 first; reads through `/mnt/` are slow.
 
+### Four-GPU launch (Linux)
+
+Clone this fork and build using the prerequisites above, or use the
+[isolated CUDA container build](tools/tp4/README.md#isolated-build) on Fedora:
+
+```bash
+git clone https://github.com/sdekok/Infernix.git
+cd Infernix
+cmake --preset release
+cmake --build build -j
+```
+
+Download all three artifact parts and the shared `.ngram` volume from
+[NVIDIA NVFP4 Dense8 Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix)
+into one model directory. Adjust the directory below to match your download:
+
+```bash
+MODEL_DIR=/models/infernix-dense8
+./build/apps/infernix-serve \
+  "$MODEL_DIR/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix-00001-of-00003.infernix" \
+  --ngram-volume "$MODEL_DIR/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram" \
+  --device 0 --parallel-devices 0,1,2,3 --pipeline-parallel \
+  --max-context 131072 --kv-dtype int8 --prefill-chunk 2048 \
+  --spec mtp --draft-tokens 3 --lm-head-draft --max-concurrency 1
+```
+
+The container build places the executable at `build-tp4/apps/infernix-serve`.
+Omit `--pipeline-parallel` for rotating TP4, or replace it with
+`--fixed-kv-owners` for fixed-KV TP4. Capacity and expert-cache residency compete
+for each GPU's memory; keep the 128K INT8 setting when reproducing these results.
+The [test runners](tools/tp4/README.md) record commands, throughput and per-GPU
+memory and can restore a named systemd inference service after testing.
+
 ## Models
 
 - **[Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix)**
@@ -291,8 +391,8 @@ other GPUs and machines (PCIe x16 results especially), fixes, features and docum
 
 ## Support
 
-Infernix is developed with Claude Code. If you would like to help pay for that subscription, you can
-[sponsor me on GitHub](https://github.com/sponsors/Wallawalla47).
+To support upstream Infernix development, you can
+[sponsor Wallawalla47 on GitHub](https://github.com/sponsors/Wallawalla47).
 
 ## Thanks
 

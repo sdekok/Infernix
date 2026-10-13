@@ -46,7 +46,8 @@ void dispatch_nvfp4(const Tensor& k, const Tensor& v, const Tensor& positions, C
         launch_nvfp4_for<KVCacheAppendD256Kv4>(k, v, positions, cache, metadata, stream);
         return;
     }
-    launch_nvfp4_for<KVCacheAppendD256Kv2>(k, v, positions, cache, metadata, stream);
+    if (k.ne[1] == 1) { launch_nvfp4_for<KVCacheAppendD256Kv1>(k, v, positions, cache, metadata, stream); }
+    else { launch_nvfp4_for<KVCacheAppendD256Kv2>(k, v, positions, cache, metadata, stream); }
 }
 
 } // namespace
@@ -83,8 +84,10 @@ void kv_cache_append_nvfp4_batch_launch(const Tensor& k, const Tensor& v, const 
             };
             if (k.ne[1] == 4)
                 append.template operator()<KVCacheAppendD256Kv4>();
-            else
+            else if (k.ne[1] == 2)
                 append.template operator()<KVCacheAppendD256Kv2>();
+            else
+                append.template operator()<KVCacheAppendD256Kv1>();
             CUDA_CHECK(cudaGetLastError());
             return;
         }

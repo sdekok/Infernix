@@ -4,6 +4,7 @@
 target_sources(infernix_model_loading PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/config.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/load.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/parallel_weights.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/expert_store.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/memory_plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/ngram_hash.cpp"
@@ -12,6 +13,8 @@ target_sources(infernix_model_loading PRIVATE
 target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/execution/parameters.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/forward.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/execution/parallel.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/execution/parallel_state.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/expert_stream.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/ngram_volume.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/program.cpp"

@@ -165,6 +165,18 @@ detail::CausalConvSplitGeometry resolve_split_geometry(const Tensor& x, const Te
     if (x.ne[0] == 10240 && out0.ne[0] == 2048 && out1.ne[0] == 2048 && out2.ne[0] == 6144) {
         return detail::CausalConvSplitGeometry::Rows2048x2048x6144;
     }
+    if (x.ne[0] == 2560 && out0.ne[0] == 512 && out1.ne[0] == 512 && out2.ne[0] == 1536) {
+        return detail::CausalConvSplitGeometry::Rows512x512x1536;
+    }
+    if (x.ne[0] == 3200 && out0.ne[0] == 640 && out1.ne[0] == 640 && out2.ne[0] == 1920) {
+        return detail::CausalConvSplitGeometry::Rows640x640x1920;
+    }
+    if (x.ne[0] == 3840 && out0.ne[0] == 768 && out1.ne[0] == 768 && out2.ne[0] == 2304) {
+        return detail::CausalConvSplitGeometry::Rows768x768x2304;
+    }
+    if (x.ne[0] == 5120 && out0.ne[0] == 1024 && out1.ne[0] == 1024 && out2.ne[0] == 3072) {
+        return detail::CausalConvSplitGeometry::Rows1024x1024x3072;
+    }
     throw std::invalid_argument("causal_conv1d: split received an unregistered row profile");
 }
 

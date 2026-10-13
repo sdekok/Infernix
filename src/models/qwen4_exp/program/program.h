@@ -319,6 +319,10 @@ struct PrefixCachePersistence {
 };
 
 struct ProgramOptions {
+    std::vector<int> parallel_devices;
+    bool pipeline_parallel = false;
+    bool fixed_kv_owners = false;
+    bool use_cuda_graph = true;
     std::uint32_t max_context     = 0;
     std::uint32_t max_concurrency = 1;
     std::uint32_t prefill_chunk   = 1024;

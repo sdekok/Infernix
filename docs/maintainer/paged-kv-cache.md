@@ -292,6 +292,9 @@ address=base+d\,nb_0+o\,nb_1+g\,nb_2+h\,nb_3
 \]
 
 Code and scale planes use the same \(g\) but their own Tensor's leading coordinate and strides.
+An explicitly aligned HeadMajor pool may pad the backing after each head: `nb[3]` includes that
+padding, while `ne[2]` remains the logical page capacity. Flash-Next TP uses this to map disjoint
+whole-head ranges to different physical GPUs; host page records exclude the padding.
 The exact persistent codec is defined by [`kv_cache_append.h`](../../include/infernix/ops/kv_cache_append.h)
 and the consumer arithmetic by [`softmax_attention.h`](../../include/infernix/ops/softmax_attention.h); the
 allocator interprets only plane bytes, order and page-group identity.

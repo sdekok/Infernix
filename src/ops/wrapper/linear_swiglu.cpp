@@ -48,7 +48,8 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     }
     if (qtype == QType::BF16) {
         // The register-streamed route of Qwen3.8-Flash-Next's shared expert, decode widths only.
-        if (gate_up_rows != 1280 || input_rows != 2560 || max_tokens > detail::kBf16LinearSwiGluStreamMaxColumns) {
+        if (gate_up_rows <= 0 || gate_up_rows > 1280 || gate_up_rows % 32 != 0 || input_rows != 2560 ||
+            max_tokens > detail::kBf16LinearSwiGluStreamMaxColumns) {
             throw std::invalid_argument("linear_swiglu workspace: BF16 serves gate/up [1280, 2560] at 1..16 columns");
         }
         return 0;
@@ -86,8 +87,9 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     const bool q8_shape = (x.ne[0] == 2048 && out.ne[0] == 6144 && gate_up_weight.n == 12288 &&
                            gate_up_weight.k == 2048 && gate_up_weight.padded_shape[0] == 12288 &&
                            gate_up_weight.padded_shape[1] == 2048) ||
-                          (x.ne[0] == 2560 && out.ne[0] == 640 && gate_up_weight.n == 1280 &&
-                           gate_up_weight.k == 2560 && gate_up_weight.padded_shape[0] == 1280 &&
+                          (x.ne[0] == 2560 && out.ne[0] > 0 && out.ne[0] <= 640 && out.ne[0] % 16 == 0 &&
+                           gate_up_weight.n == 2 * out.ne[0] &&
+                           gate_up_weight.k == 2560 && gate_up_weight.padded_shape[0] == gate_up_weight.n &&
                            gate_up_weight.padded_shape[1] == 2560);
     if (t <= 0 || x.ne[2] != 1 || x.ne[3] != 1 || out.ne[1] != t || out.ne[2] != 1 ||
         out.ne[3] != 1 || (!large_shape && !q8_shape)) {

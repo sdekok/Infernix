@@ -1,4 +1,6 @@
 #include "models/qwen4_exp/execution/forward.h"
+#include "models/qwen4_exp/execution/parallel.h"
+#include "models/qwen4_exp/head_partition.h"
 
 #include "infernix/ops/causal_conv1d_silu.h"
 #include "infernix/ops/embedding.h"
@@ -45,7 +47,7 @@ void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceA
 
 // The shared expert's SiLU(gate) * up: one fused call for Q8 weights (gate and up stay FP32); BF16
 // weights (recipe A) project, split and multiply.
-void shared_swiglu(const Tensor& x, const LinearParameters& gate_up, Tensor& out, WorkspaceArena& work,
+void primary_shared_swiglu(const Tensor& x, const LinearParameters& gate_up, Tensor& out, WorkspaceArena& work,
                    cudaStream_t s) {
     // Q8 (Dense8) at every width; BF16 (the bit-exact artifact) on its register-streamed route at decode
     // and verification widths, the tuned GEMM then SwiGLU beyond.
@@ -69,6 +71,15 @@ void shared_swiglu(const Tensor& x, const LinearParameters& gate_up, Tensor& out
 
 } // namespace
 
+void Forward::project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceArena& work, cudaStream_t s) {
+    if (experts_.parallel && experts_.parallel->project(x, p, out)) { return; }
+    ops::linear(x, p.weight, out, p.policy, work, s);
+}
+void Forward::shared_swiglu(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceArena& work, cudaStream_t s) {
+    if (experts_.parallel) { experts_.parallel->swiglu(x, p, out); }
+    else { primary_shared_swiglu(x, p, out, work, s); }
+}
+
 ops::QsaGeometry qsa_geometry(const TextConfig& c) {
     return {.heads          = dim(c.attention.heads),
             .kv_heads       = dim(c.attention.kv_heads),
@@ -90,7 +101,7 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
       state_(std::move(state)), kv_(std::move(kv)), experts_(std::move(experts)), max_context_(max_context),
       rope_(ops::prepare_rope(dim(config_.rope.rotary_dim), config_.rope.theta,
                               {config_.rope.yarn_factor, config_.max_position_embeddings})) {
-    if (state_.gdn == nullptr || state_.gdn->layer_count() != config_.gdn_layers ||
+    if (state_.gdn == nullptr || (!state_.parallel_gdn && state_.gdn->layer_count() != config_.gdn_layers) ||
         state_.qsa_tails.size() != config_.attention_layers || kv_.layers.size() != config_.attention_layers ||
         experts_.frames.size() != config_.num_hidden_layers) {
         throw std::invalid_argument("Qwen4Exp forward: state, KV or expert residency is incomplete");
@@ -204,6 +215,7 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
         } else {
             // A verification call records the raw index keys for the tail commit.
             const AttentionCall call{
+                .layer_index = static_cast<int>(compact),
                 .layer        = kv_.layers.at(compact),
                 .tails        = state_.qsa_tails.at(compact),
                 .key_records  = batch.verify != nullptr
@@ -308,6 +320,10 @@ void Forward::finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits
     Tensor final_x = mix(parameters_.final_mixer, residual, nullptr);
     Tensor last    = work_.alloc(DType::BF16, {H, batch.logit_columns.ne[0]});
     ops::gather_columns(final_x, batch.logit_columns, last, s);
+    if (parameters_.parallel_head) {
+        experts_.parallel->head(last, *parameters_.parallel_head, *logits);
+        return;
+    }
     if (parameters_.output_head_q8) {
         ops::projection_fp32(last, parameters_.output_head_q8->weight, *logits, s);
     } else {
@@ -321,8 +337,12 @@ Tensor Forward::mix(const HyperConnectionParameters& p, const Tensor& residual, 
     const std::int32_t T = residual.ne[1], H = dim(config_.hidden_size);
     const std::int32_t S = dim(config_.hc.streams), rank = dim(config_.hc.rank);
     Tensor x = work_.alloc(DType::BF16, {H, T});
-    ops::hyper_connection_mix(residual, p.norm, p.down.weight, p.up.weight, p.down.policy, S, rank, config_.rms_norm_eps,
-                              x, p.combine ? inject : nullptr, work_, s);
+    if (experts_.parallel) {
+        experts_.parallel->mix(residual, p, S, rank, config_.rms_norm_eps, x, p.combine ? inject : nullptr, work_);
+    } else {
+        ops::hyper_connection_mix(residual, p.norm, p.down.weight, p.up.weight, p.down.policy, S, rank, config_.rms_norm_eps,
+                                  x, p.combine ? inject : nullptr, work_, s);
+    }
     return x;
 }
 
@@ -354,6 +374,9 @@ void Forward::ple(const PleParameters& p, Tensor& residual, const ForwardBatch& 
 }
 
 Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch) {
+    if (experts_.parallel) {
+        return experts_.parallel->gdn(x, p, index, batch, *state_.parallel_gdn, work_);
+    }
     const cudaStream_t s = device_.stream;
     const auto& g        = config_.gdn;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size);
@@ -439,6 +462,7 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
 }
 
 Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const AttentionCall& call) {
+    if (experts_.parallel) { return experts_.parallel->attention(p, x, call, kv_.block_tables, rope_, work_); }
     const cudaStream_t s = device_.stream;
     const auto& a        = config_.attention;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size);
@@ -535,7 +559,8 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size), E = dim(m.experts), K = dim(m.top_k);
     Tensor logits = work_.alloc(DType::FP32, {E + 1, T});
     const Tensor* rows[] = {&p.router, &p.shared_score};
-    ops::projection_fp32(x, rows, logits, s);
+    if (p.parallel_router) { experts_.parallel->head(x, *p.parallel_router, logits); }
+    else { ops::projection_fp32(x, rows, logits, s); }
     ops::MoeRouting routing{work_.alloc(DType::I32, {K, T}), work_.alloc(DType::FP32, {K, T}),
                             work_.alloc(DType::FP32, {T})};
     ops::moe_route(logits, K, routing, s);
@@ -551,9 +576,14 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
             cudaSuccess) {
         throw std::runtime_error("Qwen4Exp forward: route tap copy failed");
     }
+    const bool root_owns = !experts_.parallel || pipeline_owns(layer, 0, config_.num_hidden_layers, experts_.parallel->size(), experts_.parallel->pipeline());
     const DeviceSpan dispatch_bytes = work_.alloc_bytes(ops::moe_dispatch_bytes(E, K * T));
     ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E, K * T);
-    ops::moe_dispatch(routing, E, dispatch, route_log, s);
+    const int owners = experts_.parallel ? experts_.parallel->size() : 1;
+    ops::moe_dispatch(routing, E, dispatch, route_log, s, 0, owners, experts_.parallel ? experts_.parallel->expert_owners(layer) : nullptr);
+    if (experts_.parallel) {
+        experts_.parallel->begin_experts(layer, x, routing, batch && batch->stream, batch && batch->release_stream);
+    }
     ops::MoeExpertSource source{.frame_base   = experts_.frame_base,
                                 .frames       = experts_.frames.at(layer),
                                 .host_records = reinterpret_cast<const std::uint8_t*>(p.bank->planes.device_records),
@@ -570,10 +600,10 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     }
     source.error = experts_.error;
     // Prefill chunks (one sequence of many positions, run eagerly) overlap staging with compute.
-    if (eager_chunk_ && experts_.overlap_stream != nullptr) {
+    if (root_owns && eager_chunk_ && experts_.overlap_stream != nullptr) {
         source.overlap_stream = experts_.overlap_stream;
         for (int i = 0; i < 5; ++i) { source.overlap_events[i] = experts_.overlap_events[static_cast<std::size_t>(i)]; }
-    } else if (experts_.overlap_stream != nullptr) {
+    } else if (root_owns && experts_.overlap_stream != nullptr) {
         // Decode and verification calls (one pass, possibly graph-captured): resident experts
         // compute while the misses stage on the same side stream.
         source.fork_stream    = experts_.overlap_stream;
@@ -607,7 +637,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         }
     }
     // A streamed prefill chunk: the layer's copied-ahead experts are read from the ring.
-    ExpertStream* const streaming = eager_chunk_ && batch != nullptr && batch->stream && experts_.stream != nullptr &&
+    ExpertStream* const streaming = root_owns && eager_chunk_ && batch != nullptr && batch->stream && experts_.stream != nullptr &&
                                             experts_.stream->active()
                                         ? experts_.stream
                                         : nullptr;
@@ -648,7 +678,8 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     const std::int32_t max_jobs = std::min(E, K * T);
     const DeviceSpan expert_ws  = work_.alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T, T, source.activation));
     // The shared expert runs while the host computes the CPU-served misses.
-    ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false);
+    // The second stage has no primary-owned experts; its peers fill every output slot.
+    if (root_owns) { ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false); }
     if (streaming != nullptr && batch->release_stream) { streaming->after_experts(layer, s); }
 
     const std::int32_t I = dim(m.shared_intermediate);
@@ -656,9 +687,10 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     shared_swiglu(x, p.shared_gate_up, product, work_, s);
     Tensor shared = work_.alloc(DType::BF16, {H, T});
     project(product, p.shared_down, shared, work_, s);
-    ops::moe_experts_cpu_wait(x, dispatch, source, max_jobs, expert_ws.data, outputs, s);
+    if (root_owns) { ops::moe_experts_cpu_wait(x, dispatch, source, max_jobs, expert_ws.data, outputs, s); }
     Tensor y = work_.alloc(DType::BF16, {H, T});
-    ops::moe_combine(outputs, routing, shared, y, s);
+    if (experts_.parallel) { experts_.parallel->combine_experts(layer, routing, outputs, shared, y); }
+    else { ops::moe_combine(outputs, routing, shared, y, s); }
     return y;
 }
 
@@ -709,7 +741,8 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
 
         Tensor inject = work_.alloc(DType::FP32, {S, T});
         Tensor xa     = mix(p.attn_hc, residual, &inject);
-        const AttentionCall attention_call{.layer        = *kv_.mtp,
+        const AttentionCall attention_call{.layer_index = static_cast<int>(config_.attention_layers),
+                                           .layer        = *kv_.mtp,
                                            .tails        = state_.mtp_tails,
                                            .key_records  = call.key_records,
                                            .update_tails = call.kv_only && call.key_records.data == nullptr,
@@ -731,14 +764,16 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
         const std::int32_t E = dim(m.experts), K = dim(m.top_k), I = dim(m.intermediate);
         Tensor logits = work_.alloc(DType::FP32, {E + 1, T});
         const Tensor* router_rows[] = {&p.router, &p.shared_score};
-        ops::projection_fp32(xm, router_rows, logits, s);
+        if (p.parallel_router) { experts_.parallel->head(xm, *p.parallel_router, logits); }
+        else { ops::projection_fp32(xm, router_rows, logits, s); }
         ops::MoeRouting routing{work_.alloc(DType::I32, {K, T}), work_.alloc(DType::FP32, {K, T}),
                                 work_.alloc(DType::FP32, {T})};
         ops::moe_route(logits, K, routing, s);
         Tensor outputs = work_.alloc(DType::BF16, {H, K * T});
         const DeviceSpan expert_ws = work_.alloc_bytes(ops::resident_moe_workspace_bytes(K * T, I));
-        ops::resident_moe_experts(xm, routing.ids, p.experts_gate_up, p.experts_down, E, I, expert_ws.data,
-                                  expert_ws.bytes, outputs, s);
+        if (experts_.parallel) { experts_.parallel->resident_experts(xm, routing, p, outputs); }
+        else { ops::resident_moe_experts(xm, routing.ids, p.experts_gate_up, p.experts_down, E, I, expert_ws.data,
+                                        expert_ws.bytes, outputs, s); }
         const std::int32_t SI = dim(m.shared_intermediate);
         Tensor product = work_.alloc(DType::BF16, {SI, T});
         shared_swiglu(xm, p.shared_gate_up, product, work_, s);
@@ -755,7 +790,9 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
         const auto& head = parameters_.draft_head;
         const std::int32_t rows_out = head.rows ? head.rows->weight.n : dim(config_.vocab_size);
         Tensor head_logits = work_.alloc(DType::FP32, {rows_out, T});
-        if (head.rows) {
+        if (experts_.parallel) {
+            experts_.parallel->head(final_x, head.rows ? *head.rows : *parameters_.parallel_head, head_logits);
+        } else if (head.rows) {
             ops::projection_fp32(final_x, head.rows->weight, head_logits, s);
         } else if (parameters_.output_head_q8) {
             ops::projection_fp32(final_x, parameters_.output_head_q8->weight, head_logits, s);

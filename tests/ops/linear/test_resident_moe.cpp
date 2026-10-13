@@ -119,6 +119,26 @@ void run_case(QType qtype, std::int32_t experts, std::int32_t columns, std::uint
     std::vector<std::uint16_t> out(static_cast<std::size_t>(H) * K * columns);
     cudaMemcpy(out.data(), dout, out.size() * 2, cudaMemcpyDeviceToHost);
 
+    // The same public problem through four disjoint resident expert owners.
+    // Each call must leave every other owner's routed slots untouched.
+    cudaMemset(dout, 0xFF, out.size() * 2);
+    const auto rows = [](infernix::Weight w, int first, int count) {
+        const int row_bytes = w.padded_shape[1] / (w.qtype == QType::Q4_G64_FP16 ? 2 : 1);
+        w.qdata = static_cast<const std::uint8_t*>(w.qdata) + std::size_t(first) * row_bytes;
+        w.scales = static_cast<const std::uint8_t*>(w.scales) + std::size_t(first) * (w.padded_shape[1] / w.group_size) * 2;
+        w.n = w.shape[0] = w.padded_shape[0] = w.scale_ne[1] = count;
+        return w;
+    };
+    for (int owner = 0; owner < 4; ++owner) {
+        const int first = experts * owner / 4, count = experts * (owner + 1) / 4 - first;
+        infernix::ops::resident_moe_experts(tx, tids, rows(gu_weight, first * 2 * I, count * 2 * I),
+            rows(dn_weight, first * H, count * H), experts, I, ws, ws_bytes, tout, nullptr, first, count);
+    }
+    std::vector<std::uint16_t> partitioned(out.size());
+    cudaMemcpy(partitioned.data(), dout, partitioned.size() * 2, cudaMemcpyDeviceToHost);
+    check(partitioned == out, "resident expert partitions retain every routed output bit");
+    out = std::move(partitioned); // Qualify the partitioned route directly against the FP64 oracle below.
+
     const Decoder gu{gate_up, qtype}, dn{down, qtype};
     long bad = 0;
     double worst = 0;

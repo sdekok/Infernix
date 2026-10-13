@@ -1,0 +1,18 @@
+ARG BASE_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04
+FROM ${BASE_IMAGE}
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    build-essential cmake ninja-build pkg-config libavformat-dev libavcodec-dev \
+    libavutil-dev libswscale-dev libcurl4-openssl-dev && rm -rf /var/lib/apt/lists/*
+# Some inference images bundle CUDA headers in the NVIDIA Python package.
+RUN if [ ! -f /usr/local/cuda/include/nvtx3/nvToolsExt.h ]; then \
+      nvtx_header=$(find /usr/local/lib -path '*/include/nvtx3/nvToolsExt.h' -print -quit); \
+      test -n "$nvtx_header" && cp -a "$(dirname "$nvtx_header")" /usr/local/cuda/include/; \
+    fi
+RUN if [ ! -f /usr/local/cuda/include/cuda_profiler_api.h ]; then \
+      cuda_release=$(nvcc --version | sed -n 's/.*release \([0-9]*\)\.\([0-9]*\),.*/\1-\2/p'); \
+      test -n "$cuda_release" && apt-get update && \
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "cuda-profiler-api-$cuda_release" && \
+      rm -rf /var/lib/apt/lists/*; \
+    fi
+WORKDIR /work
+ENTRYPOINT ["/bin/bash"]

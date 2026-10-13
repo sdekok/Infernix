@@ -50,7 +50,9 @@ std::uint32_t ExpertStream::slots_in(std::size_t bytes) const noexcept {
     return static_cast<std::uint32_t>((bytes - tables) / stride_) & ~1U;
 }
 
-void ExpertStream::begin(DeviceSpan ring, const std::int32_t* residency, cudaStream_t compute, bool gated) {
+void ExpertStream::begin(DeviceSpan ring, const std::int32_t* residency, cudaStream_t compute, bool gated, std::uint32_t first, std::uint32_t end) {
+    first_ = first; end_ = std::min(end, layers_);
+    if (first_ >= end_) { throw std::invalid_argument("empty streamed layer range"); }
     if (active_) { throw std::logic_error("expert stream: a chunk is already streaming"); }
     const std::uint32_t slots = slots_in(ring.bytes);
     if (slots < 2 || ring.data == nullptr) { throw std::invalid_argument("expert stream: the ring holds no slots"); }
@@ -78,7 +80,7 @@ void ExpertStream::begin(DeviceSpan ring, const std::int32_t* residency, cudaStr
         const std::int32_t* frames = residency + static_cast<std::size_t>(l) * experts_;
         std::uint32_t taken = 0;
         for (std::uint32_t e = 0; e < experts_; ++e) {
-            const bool stream = frames[e] < 0 && taken < half_ && record_of_(l, e) != nullptr;
+            const bool stream = l >= first_ && l < end_ && frames[e] < 0 && taken < half_ && record_of_(l, e) != nullptr;
             row[e]            = stream ? static_cast<std::int32_t>((l % 2) * half_ + taken++) : -1;
             if (stream && hold_) { hold_(l, e); }
         }
@@ -92,8 +94,8 @@ void ExpertStream::begin(DeviceSpan ring, const std::int32_t* residency, cudaStr
     CUDA_CHECK(cudaEventRecord(start_, compute));
     CUDA_CHECK(cudaStreamWaitEvent(stream_, start_, 0));
     active_ = true;
-    enqueue(0);
-    if (layers_ > 1) { enqueue(1); }
+    enqueue(first_);
+    if (first_ + 1 < end_) { enqueue(first_ + 1); }
 }
 
 std::uint32_t ExpertStream::plan_layer(std::uint32_t layer, std::span<const std::int32_t> columns,
@@ -114,7 +116,7 @@ std::uint32_t ExpertStream::plan_layer(std::uint32_t layer, std::span<const std:
     streams_[layer] = 1; // the MoE waits for the table upload even when nothing is copied
     // The half's previous readers (layer - 2's experts) release it first; the table rides ahead of
     // the copies on the copy stream, so the layer's landed event covers both.
-    if (layer >= 2) { CUDA_CHECK(cudaStreamWaitEvent(stream_, consumed_[layer - 2], 0)); }
+    if (layer >= first_ + 2) { CUDA_CHECK(cudaStreamWaitEvent(stream_, consumed_[layer - 2], 0)); }
     CUDA_CHECK(cudaMemcpyAsync(tables_ + static_cast<std::size_t>(layer) * experts_, row, experts_ * sizeof(std::int32_t),
                                cudaMemcpyHostToDevice, stream_));
     enqueue(layer);
@@ -126,7 +128,7 @@ const std::int32_t* ExpertStream::slots(std::uint32_t layer) const noexcept {
 }
 
 void ExpertStream::enqueue(std::uint32_t layer) {
-    if (layer >= 2) { CUDA_CHECK(cudaStreamWaitEvent(stream_, consumed_[layer - 2], 0)); }
+    if (layer >= first_ + 2) { CUDA_CHECK(cudaStreamWaitEvent(stream_, consumed_[layer - 2], 0)); }
     const auto* row = static_cast<const std::int32_t*>(tables_host_.data()) + static_cast<std::size_t>(layer) * experts_;
     // Runs of consecutive experts in consecutive slots and adjacent records of one allocation: one
     // copy per run (a copy may not span two pinned allocations, even adjacent ones), all enqueued as
@@ -160,7 +162,7 @@ void ExpertStream::before_experts(std::uint32_t layer, cudaStream_t compute) {
 void ExpertStream::after_experts(std::uint32_t layer, cudaStream_t compute) {
     if (!active_) { return; }
     CUDA_CHECK(cudaEventRecord(consumed_[layer], compute));
-    if (!gated_ && layer + 2 < layers_) { enqueue(layer + 2); }
+    if (!gated_ && layer + 2 < end_) { enqueue(layer + 2); }
 }
 
 } // namespace infernix::models::qwen4_exp::execution

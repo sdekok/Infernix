@@ -29,6 +29,7 @@ namespace infernix::ops {
 /// precondition violation. The oracle is the same formula in FP64 over the decoded weights.
 void resident_moe_experts(const Tensor& x, const Tensor& ids, const Weight& gate_up, const Weight& down,
                           std::int32_t experts, std::int32_t intermediate, void* workspace,
-                          std::size_t workspace_bytes, Tensor& outputs, cudaStream_t stream);
+                          std::size_t workspace_bytes, Tensor& outputs, cudaStream_t stream,
+                          std::int32_t first_expert = 0, std::int32_t local_experts = -1);
 
 } // namespace infernix::ops

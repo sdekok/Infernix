@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace infernix::ops::offloaded_moe::wide {
 namespace {
@@ -326,13 +327,16 @@ ExpertsWorkspace carve_experts_workspace(void* base, std::int32_t max_jobs, std:
 }
 
 int persistent_ctas() {
-    static const int ctas = [] {
-        int device = 0, sms = 0;
-        CUDA_CHECK(cudaGetDevice(&device));
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    static thread_local std::vector<int> counts;
+    if (counts.size() <= static_cast<std::size_t>(device)) { counts.resize(device + 1); }
+    if (counts[device] == 0) {
+        int sms = 0;
         CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
-        return sms * Schedule::kMinBlocksPerSm;
-    }();
-    return ctas;
+        counts[device] = sms * Schedule::kMinBlocksPerSm;
+    }
+    return counts[device];
 }
 
 Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source, std::int32_t top_k,
